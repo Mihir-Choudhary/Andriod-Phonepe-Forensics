@@ -1,5 +1,19 @@
 # PhonePe Android Forensics
 
+## 🙏 Credits & Acknowledgements
+
+This tool was **inspired by, and built on the foundation of, [Sujay Adkesar](https://github.com/sujayadkesar)'s
+[PhonePe-Forensics](https://github.com/sujayadkesar/PhonePe-Forensics)** project. Sujay's repository was
+used as the **reference** to code this Android tool and to **understand the PhonePe forensic architecture**
+(the normalized data contract, correlator/timeline/social-graph engine, hunt console and report layer).
+Full credit and thanks to Sujay Adkesar for the original work that made this Android port possible.
+
+> 🔜 **Coming soon:** this Android tool will be **merged back into Sujay's repo** so there is a **single
+> tool that handles both iOS and Android** — instead of two separate tools. You'll pick the platform on
+> launch and the analyser loads the matching parser and layout.
+
+---
+
 A local, **read-only** DFIR web tool that parses a PhonePe **Android** acquisition
 (`com.phonepe.app`) and presents transactions, chat, contacts, the split/bill ledger,
 identity & device fingerprint, a unified timeline, social graph and suspicious-signal
@@ -60,9 +74,14 @@ ambiguous phones (mapping to more than one person) are left unresolved, never gu
 
 ## Limitations
 
-- Three databases are **SQLCipher-encrypted** (incl. `AccountAggregatorDatabase`) and are
-  recorded as present-but-not-decryptable — they need the device keystore key, which a
-  file-system image does not contain.
+- Three databases are **SQLiteCrypt-encrypted** (`AccountAggregatorDatabase`, `mdb`, and a
+  UUID-named DB — each carries a `SQLitecrypt.com` header) and are recorded as
+  present-but-not-decryptable. The whole-DB AES key is not on disk: the encrypted passphrase
+  lives in `shared_prefs/common-encrypted-shared-pref.xml` (AndroidX `EncryptedSharedPreferences`),
+  which is wrapped by a Tink keyset, which is wrapped by an **Android Keystore** master key whose
+  bytes live in the device **TEE/StrongBox** and never touch the file system. A static image
+  therefore cannot decrypt them — that needs the device's secure hardware (e.g. a rooted live
+  device or runtime key extraction).
 
 ## Architecture
 
