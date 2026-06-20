@@ -39,7 +39,7 @@ from .core_android import (
 _DIRECTION_BY_TYPE = {
     "RECEIVED_PAYMENT": "IN",
     "SENT_PAYMENT": "OUT",
-    "EXPENSE_SETTLEMENT": "OUT",   # split settlement; direction assumes self=payer (TODO: resolve via ledger self-member)
+    "EXPENSE_SETTLEMENT": "OUT",   # fallback only — real direction resolved per-row from payer/payeeMemberId vs self (see extract_transactions)
     "PIEDPIPER_PAYMENT": "OUT",    # PiedPiper SDK payment; refine when sampled
     "P2P_ENRICHMENT": "INTERNAL",  # metadata sibling (groupId/referenceId), NOT a money movement
 }
@@ -104,6 +104,14 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
         # Cross-table resolver (masked counterparty → real name/full destination). Built
         # inside the db block; afterwards it holds only plain dicts so it outlives `db`.
         resolver = IdentityResolver(db)
+        # Self's ledger/chat member ids (one per topic) — used to resolve the direction of
+        # EXPENSE_SETTLEMENT rows, whose tstore carries payerMemberId/payeeMemberId but no legs.
+        self_member_ids: set = set()
+        for _tbl, _col in (("chatTopicMeta", "ownMemberId"), ("ledger_my_split_topic", "ownMemberId")):
+            if db.has_table(_tbl):
+                for _m in db.query(f"SELECT {_col} FROM {_tbl}"):
+                    if "_error" not in _m and _m.get(_col):
+                        self_member_ids.add(_m[_col])
 
     tokens_by_txn: Dict[str, set] = defaultdict(set)
     for tr in token_rows:
@@ -141,6 +149,17 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
 
         direction = _direction(ttype, tstore)
         ctx = tstore.get("context") or {}
+
+        # EXPENSE_SETTLEMENT carries no payment legs — its direction comes from whether
+        # self (any of our per-topic member ids) is the payer (OUT) or the payee (IN).
+        settle_other_member = None
+        if ttype == "EXPENSE_SETTLEMENT":
+            payer, payee = tstore.get("payerMemberId"), tstore.get("payeeMemberId")
+            if payer in self_member_ids and payee not in self_member_ids:
+                direction, settle_other_member = "OUT", payee
+            elif payee in self_member_ids and payer not in self_member_ids:
+                direction, settle_other_member = "IN", payer
+            # else: self on both/neither side — keep the _DIRECTION_BY_TYPE default (OUT)
 
         # Resolve counterparty vs self legs by direction.
         if direction == "IN":
@@ -184,6 +203,15 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
                 cp_resolved_names = hit.get("names")          # per-source names (saved-in-PhonePe vs phonebook…)
                 cp_resolved_source = "matched by " + (hit.get("via") or "phone")
                 cp_phone_full = hit.get("phone") or (cp_phone if not _is_masked(cp_phone) else None)
+
+        # Settlement rows have no payment leg, so the counterparty is empty — fill it from
+        # the split partner (the other ledger member) resolved to a real contact name.
+        if ttype == "EXPENSE_SETTLEMENT" and settle_other_member and not cp_name:
+            hit = resolver.by_member(settle_other_member)
+            if hit and hit.get("name"):
+                cp_name = hit["name"]
+                cp_resolved_names = hit.get("names")
+                cp_phone = cp_phone or hit.get("phone")
 
         # Self identity harvested from the owner leg.
         self_holder = self_leg.get("accountHolderName")
