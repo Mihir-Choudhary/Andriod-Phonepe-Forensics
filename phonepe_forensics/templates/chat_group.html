@@ -233,9 +233,7 @@
 
                 {% if v2.bank_name %}<div class="pcard-line">Bank: {{ v2.bank_name }}{% if v2.merchant_subtype %} · <span class="muted small">{{ v2.merchant_subtype }}</span>{% endif %}</div>{% endif %}
                 {% if m.transaction_id %}
-                  <div class="pcard-line">Txn <a href="{{ url_for('page_transaction_detail', txn_id=m.transaction_id) }}" class="mono small">{{ m.transaction_id }}</a>
-                  · <a href="{{ url_for('page_raw_record', source='payment', row_pk=m.transaction_id) }}" class="mono small" target="_blank">{ } raw + provenance</a>
-                  </div>
+                  <div class="pcard-line">Txn <a href="{{ url_for('page_transaction_detail', txn_id=m.transaction_id) }}" class="mono small">{{ m.transaction_id }}</a></div>
                 {% endif %}
                 {% if m.utr %}<div class="pcard-line">UTR <span class="mono small">{{ m.utr }}</span></div>{% endif %}
                 {% if v2.failure_reason %}<div class="pcard-line muted small">Failure: {{ v2.failure_reason }}</div>{% endif %}

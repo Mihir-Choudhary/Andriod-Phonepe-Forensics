@@ -295,6 +295,9 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
         "net_flow_inr": round(total_in - total_out, 2),
         "yearly_received_inr": dict(sorted(yearly_in.items())),
         "yearly_sent_inr": dict(sorted(yearly_out.items())),
+        # combined per-year volume (in+out) — consumed by dashboard() + the HTML report
+        "yearly_volume_inr": {y: round(yearly_in.get(y, 0) + yearly_out.get(y, 0), 2)
+                              for y in sorted(set(yearly_in) | set(yearly_out))},
         "monthly_volume_inr": dict(sorted(monthly.items())),
         "self_account_holders": sorted(self_holders),
         "self_account_masked": sorted(self_masked),

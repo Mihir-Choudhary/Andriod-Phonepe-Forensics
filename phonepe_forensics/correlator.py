@@ -363,11 +363,11 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
         amt = t.get("amount_inr") or 0.0
         if t.get("direction") == "IN":
             node["txn_count_in"] += 1
-            if t.get("state") in ("COMPLETED", "SUCCESS"):
+            if t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"):
                 node["txn_total_in"] += amt
         elif t.get("direction") == "OUT":
             node["txn_count_out"] += 1
-            if t.get("state") in ("COMPLETED", "SUCCESS"):
+            if t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"):
                 node["txn_total_out"] += amt
         ts = t.get("created_at")
         if ts:
@@ -537,7 +537,7 @@ def detect_suspicious_signals(case_data: Dict[str, Any]) -> List[Dict[str, Any]]
         })
 
     # Very large transactions (> ₹50,000 in a single P2P)
-    large = [t for t in txns if (t.get("amount_inr") or 0) >= 50_000 and t.get("state") in ("COMPLETED", "SUCCESS")]
+    large = [t for t in txns if (t.get("amount_inr") or 0) >= 50_000 and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED")]
     if large:
         findings.append({
             "severity": "info",
@@ -646,8 +646,8 @@ def build_counterparty_profile(case_data: Dict[str, Any], identifier: str) -> Di
                     out["rewards"].append(r)
                     break
 
-    total_in = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "IN" and t.get("state") in ("COMPLETED", "SUCCESS"))
-    total_out = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "OUT" and t.get("state") in ("COMPLETED", "SUCCESS"))
+    total_in = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "IN" and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"))
+    total_out = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "OUT" and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"))
     out["summary"] = {
         "matched_contact_count": len(out["matched_contacts"]),
         "transaction_count": len(out["transactions"]),

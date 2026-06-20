@@ -3,9 +3,6 @@
 {% block heading %}Forensic Dashboard{% endblock %}
 {% block subheading %}Snapshot of identity, money flow, social graph & device activity for the active acquisition.{% endblock %}
 {% block topbar_actions %}
-{% if dashboard.v2.available %}
-<a href="{{ url_for('page_export_offline_html') }}" class="btn">↧ Offline HTML</a>
-{% endif %}
 <a href="{{ url_for('page_exports') }}" class="btn primary">↧ Export Evidence</a>
 {% endblock %}
 
@@ -111,12 +108,12 @@
   <div class="metric">
     <div class="mlabel">Mandates / requests</div>
     <div class="mvalue">{{ dashboard.v2.mandates_count }}</div>
-    <div class="msub">autopay + collect requests + enrichment · <a href="{{ url_for('page_v2_mandates') }}">view →</a></div>
+    <div class="msub">autopay + collect requests + enrichment</div>
   </div>
   <div class="metric">
     <div class="mlabel">Raw records</div>
     <div class="mvalue">{{ dashboard.metrics.transactions + dashboard.v2.mandates_count }}</div>
-    <div class="msub"><a href="{{ url_for('page_v2_raw_records') }}">browse decoded + provenance →</a></div>
+    <div class="msub">decoded + provenance</div>
   </div>
 </div>
 
