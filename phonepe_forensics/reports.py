@@ -199,9 +199,9 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
             "Registered name": ident.get("registered_name") or "—",
             "Primary UPI ID": ident.get("upi_id") or "—",
             "Phones seen": ", ".join(ident.get("phones_seen", [])) or "—",
-            "AppsFlyer User ID": ident.get("device_identifiers", {}).get("appsflyer_user_id") or "—",
-            "Firebase Install ID": ident.get("device_identifiers", {}).get("firebase_install_id") or "—",
-            "Google Ads paid_v2": ident.get("device_identifiers", {}).get("gads_paid_v2") or "—",
+            "AppsFlyer ID": ident.get("device_identifiers", {}).get("appsflyer_id") or "—",
+            "Firebase Install ID": ident.get("device_identifiers", {}).get("firebase_installation_id") or "—",
+            "Anon ID": ident.get("device_identifiers", {}).get("anon_id") or "—",
         })
     ))
 

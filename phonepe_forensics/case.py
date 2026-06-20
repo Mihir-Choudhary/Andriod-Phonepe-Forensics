@@ -175,7 +175,6 @@ class Case:
                 "upi_id": ident.get("upi_id"),
                 "phones": ident.get("phones_seen", []),
                 "location_hints": ident.get("location_hints", []),
-                "session_id_updated_at": ident.get("sessions", {}).get("session_id_updated_at"),
             },
             "metrics": {
                 "transactions": v2_total if v2_total is not None else txn_summary.get("transaction_count", 0),

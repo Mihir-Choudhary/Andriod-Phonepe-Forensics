@@ -952,8 +952,7 @@ def export_findings_csv():
 def page_db_browser():
     case = _active()
     return render_template("database_browser.html",
-                           inventory=case.data.get("database_inventory", []),
-                           plists=case.data.get("plist_inventory", []))
+                           inventory=case.data.get("database_inventory", []))
 
 
 @app.route("/database-browser/sql", methods=["GET"])
@@ -1081,12 +1080,13 @@ def api_file():
     case = _active()
     real = os.path.realpath(p)
     allowed_roots = [os.path.realpath(case.root)]
-    if case.paths.app_domain:
-        allowed_roots.append(os.path.realpath(case.paths.app_domain))
-    if case.paths.group_app:
-        allowed_roots.append(os.path.realpath(case.paths.group_app))
-    if case.paths.group_shared:
-        allowed_roots.append(os.path.realpath(case.paths.group_shared))
+    # getattr so this works regardless of the CasePaths shape (Android uses
+    # app_dir/databases_dir/…; the iOS-era app_domain/group_* may be absent).
+    for attr in ("app_dir", "databases_dir", "shared_prefs_dir", "files_dir",
+                 "webview_dir", "app_domain", "group_app", "group_shared"):
+        d = getattr(case.paths, attr, None)
+        if d:
+            allowed_roots.append(os.path.realpath(d))
     allowed_roots.append(os.path.realpath(os.path.join(os.getcwd(), "exports")))
     if not any(real.startswith(r) for r in allowed_roots):
         abort(403)
