@@ -12,12 +12,19 @@
   <div class="card-title">
     Rows {{ page.offset + 1 }}–{{ page.offset + page.rows|length }} of {{ page.row_count }}
   </div>
+  <p class="muted small">Cells are truncated for display; hover for more, or export the CSV
+     for the full values.</p>
   <div style="overflow-x:auto">
     <table>
       <thead><tr>{% for c in page.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
       <tbody>
         {% for r in page.rows %}
-        <tr>{% for c in page.columns %}<td class="mono small">{{ r.get(c) if r.get(c) is not none else '—' }}</td>{% endfor %}</tr>
+        <tr>{% for c in page.columns %}
+          {% set v = r.get(c) %}
+          <td class="mono small" title="{{ v|string|truncate(2000) }}">
+            {{ (v|string)|truncate(160) if v is not none else '—' }}
+          </td>
+        {% endfor %}</tr>
         {% endfor %}
       </tbody>
     </table>

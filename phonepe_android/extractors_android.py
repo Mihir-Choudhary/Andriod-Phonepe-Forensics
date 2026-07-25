@@ -988,7 +988,8 @@ def _read_crashlytics(paths: AndroidCasePaths) -> Dict[str, Any]:
             if not os.path.exists(p):
                 continue
             try:
-                d = _json.load(open(p, encoding="utf-8"))
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    d = _json.load(fh)
             except Exception:
                 continue
             if isinstance(d, dict):
@@ -1607,7 +1608,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         man = os.path.join(d, "manifest.json")
         if os.path.exists(man):
             try:
-                m = _json.load(open(man, encoding="utf-8"))
+                with open(man, encoding="utf-8", errors="replace") as fh:
+                    m = _json.load(fh)
                 rec.update({"app_id": m.get("appId"), "app_unique_id": m.get("appUniqueId"),
                             "name": m.get("name"), "version": m.get("appVersion"),
                             "version_id": m.get("appVersionId")})
@@ -1616,7 +1618,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         cfg = os.path.join(d, "config.json")
         if os.path.exists(cfg):
             try:
-                c = _json.load(open(cfg, encoding="utf-8"))
+                with open(cfg, encoding="utf-8", errors="replace") as fh:
+                    c = _json.load(fh)
                 first = c[0] if isinstance(c, list) and c else (c if isinstance(c, dict) else {})
                 conf = first.get("config", first) if isinstance(first, dict) else {}
                 rec["merchant_name"] = conf.get("merchantName")
@@ -1627,7 +1630,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         info = os.path.join(d, "nirvanaApplicationInfo.json")
         if os.path.exists(info):
             try:
-                i = _json.load(open(info, encoding="utf-8"))
+                with open(info, encoding="utf-8", errors="replace") as fh:
+                    i = _json.load(fh)
                 rec["category"] = i.get("category")
                 rec["installation_type"] = i.get("installationType")
                 rec["updated_at"] = normalize_timestamp(i.get("updatedAt"))

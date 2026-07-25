@@ -43,7 +43,6 @@
         <td>
           {% set nm = c.verified_name or c.external_vpa_name or '?' %}
           <span class="dp" data-initials="{{ (nm[:2])|upper }}">
-            {% if c.phone %}<img class="zoomable" data-caption="{{ nm }}" src="{{ url_for('page_avatar', phone=c.phone) }}" onerror="this.remove()" loading="lazy">{% endif %}
           </span>
         </td>
         <td>
@@ -93,7 +92,6 @@
           data-search="{{ ((c.full_name or '') ~ ' ' ~ (ph or ''))|lower }}">
         <td>
           <span class="dp" data-initials="{{ ((c.full_name or '?')[:2])|upper }}">
-            {% if ph %}<img class="zoomable" data-caption="{{ c.full_name or ph }}" src="{{ url_for('page_avatar', phone=ph) }}" onerror="this.remove()" loading="lazy">{% endif %}
           </span>
         </td>
         <td>

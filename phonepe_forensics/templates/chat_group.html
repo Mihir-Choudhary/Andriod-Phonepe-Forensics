@@ -1,9 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ group.name }} — Chat — PhonePe Android Forensics{% endblock %}
 {% block heading %}
-{% if group.v2_other_party_phone %}<img class="zoomable" data-caption="{{ group.v2_display_name or group.name }}" src="{{ url_for('page_avatar', phone=group.v2_other_party_phone) }}"
-     onerror="this.style.display='none'"
-     style="width:36px;height:36px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:10px;background:var(--bg-2)">{% endif %}Chat with {{ group.v2_display_name or group.name or '(unnamed conversation)' }}{% endblock %}
+Chat with {{ group.v2_display_name or group.name or '(unnamed conversation)' }}{% endblock %}
 {% block subheading %}Group {{ group.group_id }} · {{ members|length or group.member_count or '?' }} participants · {{ messages|length }} messages.{% if group.v2_other_party_phone %} · <span class="mono small">{{ group.v2_other_party_phone }}</span>{% endif %}{% endblock %}
 {% block topbar_actions %}
 <a href="{{ url_for('export_chat_group_csv', group_id=group.group_id) }}" class="btn">↧ Export this thread (CSV)</a>
@@ -84,8 +82,6 @@
   <div style="display:flex;align-items:center;gap:14px;margin:10px 0 4px">
     {% set _cp = counterparty.phones[0] if counterparty.phones else (group.v2_other_party_phone or '') %}
     <span class="dp dp-lg" data-initials="{{ (counterparty.display_name or '?')[:2]|upper }}">
-      {% if _cp %}<img class="zoomable" data-caption="{{ counterparty.display_name }}"
-        src="{{ url_for('page_avatar', phone=_cp) }}" onerror="this.remove()" loading="lazy">{% endif %}
     </span>
     <div>
       <div style="font-size:17px;font-weight:700">{{ counterparty.display_name }}</div>
@@ -153,12 +149,6 @@
       {% set is_self = (m.sender_is_self == true) or (m.direction == 'OUT') %}
       {% set v2 = m.v2 or {} %}
       <div class="bubble-row {% if is_self %}me{% else %}them{% endif %}">
-        {% if not is_self and group.v2_other_party_phone %}
-          <img src="{{ url_for('page_avatar', phone=group.v2_other_party_phone) }}"
-               onerror="this.style.display='none'"
-               data-caption="{{ group.v2_display_name or group.name }}"
-               class="bubble-avatar zoomable">
-        {% endif %}
         <div class="bubble {% if is_self %}me{% else %}them{% endif %}">
           <div class="bubble-meta">
             {% if is_self %}
@@ -201,7 +191,6 @@
                     <div class="rail-label">Owner side {% if is_self %}(sent from){% else %}(received on){% endif %}</div>
                     <div class="rail-vpa mono small">{{ v2.owner_vpa or '—' }}</div>
                     <div class="rail-app">
-                      {% if v2.owner_app_icon %}<img src="{{ url_for('page_app_icon', icon_id=v2.owner_app_icon) }}" onerror="this.style.display='none'" class="rail-app-icon">{% endif %}
                       <span>{{ v2.owner_app or 'Unknown' }}</span>
                       {% if v2.owner_on_phonepe %}<span class="tag info small" style="font-size:9px">PhonePe-PSP</span>
                       {% elif v2.owner_psp %}<span class="tag med small" style="font-size:9px">third-party PSP · @{{ v2.owner_psp }}</span>{% endif %}
@@ -219,7 +208,6 @@
                     {% endif %}
                     <div class="rail-app">
                       {% if v2.counterparty_app and v2.counterparty_app != 'No VPA' %}
-                        {% if v2.counterparty_app_icon %}<img src="{{ url_for('page_app_icon', icon_id=v2.counterparty_app_icon) }}" onerror="this.style.display='none'" class="rail-app-icon">{% endif %}
                         <span>{{ v2.counterparty_app }}</span>
                       {% elif not is_self %}
                         <span class="muted">PhonePe user · VPA not disclosed in feed</span>
