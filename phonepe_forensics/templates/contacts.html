@@ -9,7 +9,6 @@
   <div class="metric"><div class="mlabel">PhonePe contacts</div><div class="mvalue">{{ contacts.summary.cyclops_total }}</div></div>
   <div class="metric"><div class="mlabel">Phonebook entries</div><div class="mvalue">{{ contacts.summary.phonebook_total }}</div></div>
   <div class="metric"><div class="mlabel">On PhonePe</div><div class="mvalue pos">{{ contacts.summary.on_phonepe_count }}</div></div>
-  <div class="metric"><div class="mlabel">With transactions</div><div class="mvalue accent">{{ contacts.cyclops_contacts|selectattr('v2_has_txns')|list|length }}</div></div>
   <div class="metric"><div class="mlabel">Deleted contacts</div><div class="mvalue">{{ contacts.summary.deleted_contacts }}</div></div>
   <div class="metric"><div class="mlabel">Cached profile pics</div><div class="mvalue">{{ contacts.summary.external_image_count }}</div></div>
 </div>
@@ -30,15 +29,11 @@
       <th>Name</th>
       <th>Phone</th>
       <th>VPA</th>
-      <th class="right">Txn IN</th>
-      <th class="right">Txn OUT</th>
-      <th class="right">₹ Received</th>
-      <th class="right">₹ Sent</th>
       <th>UPI state</th>
     </tr></thead>
     <tbody>
       {% for c in contacts.cyclops_contacts %}
-      <tr data-has-txn="{{ '1' if c.v2_has_txns else '0' }}"
+      <tr
           data-search="{{ ((c.verified_name or '') ~ ' ' ~ (c.phone or '') ~ ' ' ~ (c.external_vpa or ''))|lower }}">
         <td>
           {% set nm = c.verified_name or c.external_vpa_name or '?' %}
@@ -55,11 +50,7 @@
         </td>
         <td class="mono small">{{ c.phone or '—' }}</td>
         <td class="mono small">{{ c.external_vpa or '—' }}</td>
-        <td class="right mono">{% if c.v2_txn_in %}<span class="amount-pos">{{ c.v2_txn_in }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
-        <td class="right mono">{% if c.v2_txn_out %}<span class="amount-neg">{{ c.v2_txn_out }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
-        <td class="right" style="white-space:nowrap">{% if c.v2_recv_inr %}{{ c.v2_recv_inr|inr }}{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td class="right" style="white-space:nowrap">{% if c.v2_sent_inr %}{{ c.v2_sent_inr|inr }}{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td>{% if c.upi_state %}<span class="tag {{ c.upi_state|lower }}">{{ c.upi_state }}</span>{% endif %}</td>
+                                        <td>{% if c.upi_state %}<span class="tag {{ c.upi_state|lower }}">{{ c.upi_state }}</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -80,15 +71,12 @@
       <th style="width:42px"></th>
       <th>Saved name</th>
       <th>Phone</th>
-      <th class="right">Txn IN</th>
-      <th class="right">Txn OUT</th>
-      <th class="right">₹ Net</th>
       <th>Country</th>
     </tr></thead>
     <tbody>
       {% for c in contacts.phonebook_contacts %}
       {% set ph = c.normalized or c.raw_number %}
-      <tr data-has-txn="{{ '1' if c.v2_has_txns else '0' }}"
+      <tr
           data-search="{{ ((c.full_name or '') ~ ' ' ~ (ph or ''))|lower }}">
         <td>
           <span class="dp" data-initials="{{ ((c.full_name or '?')[:2])|upper }}">
@@ -101,12 +89,6 @@
           {% else %}{{ c.full_name or '—' }}{% endif %}
         </td>
         <td class="mono small">{{ ph or '—' }}</td>
-        <td class="right mono">{% if c.v2_txn_in %}<span class="amount-pos">{{ c.v2_txn_in }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
-        <td class="right mono">{% if c.v2_txn_out %}<span class="amount-neg">{{ c.v2_txn_out }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
-        <td class="right" style="white-space:nowrap">
-          {% set net = (c.v2_recv_inr or 0) - (c.v2_sent_inr or 0) %}
-          {% if c.v2_has_txns %}<span class="{% if net>=0 %}amount-pos{% else %}amount-neg{% endif %}">{{ net|inr }}</span>{% else %}<span class="muted">—</span>{% endif %}
-        </td>
         <td>{{ c.country_code or '—' }}</td>
       </tr>
       {% endfor %}

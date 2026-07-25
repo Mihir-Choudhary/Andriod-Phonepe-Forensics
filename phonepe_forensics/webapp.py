@@ -480,6 +480,58 @@ def page_raw_table_csv(db: str, table: str):
     return _csv_response(rows, cols, f"{db}.{table}.csv")
 
 
+def _deleted_view(case: Case):
+    deleted = case.data.get("deleted_records", {}) or {}
+    records = deleted.get("records", [])
+    q = (request.args.get("q") or "").strip()
+    table_filter = request.args.get("table", "")
+    if table_filter:
+        records = [r for r in records
+                   if r.get("table") == table_filter
+                   or table_filter in (r.get("candidate_tables") or [])]
+    if q:
+        records = _filter_table(records, q=q)
+    tables = sorted({r.get("table") for r in deleted.get("records", []) if r.get("table")})
+    return deleted, records, tables, q, table_filter
+
+
+@app.route("/deleted")
+def page_deleted():
+    case = _active()
+    deleted, records, tables, q, table_filter = _deleted_view(case)
+    return render_template("deleted.html", deleted=deleted, records=records[:2000],
+                           tables=tables, q=q, table_filter=table_filter)
+
+
+@app.route("/deleted/export.csv")
+def export_deleted_csv():
+    case = _active()
+    _, records, _, _, _ = _deleted_view(case)
+    rows = []
+    for r in records:
+        row = {
+            "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
+            "confidence": r.get("confidence"),
+            "partial": r.get("partial"),
+            "truncated": r.get("truncated"),
+            "ambiguous": r.get("ambiguous"),
+            "pool": r.get("pool"),
+            "database": r.get("database"),
+            "source_file": r.get("source_file"),
+            "page": r.get("page"),
+            "file_offset": r.get("file_offset"),
+            "type_lost_for": "; ".join(r.get("lost_leading_columns") or []),
+        }
+        # Recovered values go in one column so a single CSV can carry rows from
+        # tables with different shapes without inventing a common schema.
+        row["recovered_values"] = json.dumps(r.get("row", {}), default=str)
+        rows.append(row)
+    cols = ["table", "confidence", "partial", "truncated", "ambiguous", "pool",
+            "database", "source_file", "page", "file_offset", "type_lost_for",
+            "recovered_values"]
+    return _csv_response(rows, cols, "recovered_deleted_records.csv")
+
+
 @app.route("/prefs")
 def page_prefs():
     case = _active()
@@ -1272,12 +1324,6 @@ def _err_500(e):
         "error.html", code=500,
         message="Internal error. See the server console for details.",
     ), 500
-
-
-# ---------------------------------------------------------------------------
-# v2 routes (additive — coverage / classifier / TPAP / raw provenance)
-# ---------------------------------------------------------------------------
-
 
 
 # /avatar and /app-icon are gone. Android acquisitions store no local profile

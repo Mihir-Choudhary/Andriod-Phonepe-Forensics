@@ -252,6 +252,14 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
         "description": "Every shared_prefs/*.xml key/value, flattened to one row per key.",
         "fields": ["file", "key", "value", "value_type"],
     },
+    "deleted_records": {
+        "description": "Rows carved back out of freed space, WAL frames and rollback "
+                       "journals. These are reconstructions, not live rows.",
+        "fields": [
+            "database", "table", "confidence", "partial", "truncated", "ambiguous",
+            "pool", "page", "file_offset", "source_file", "recovered_text",
+        ],
+    },
     "raw_tables": {
         "description": "Inventory of every readable SQLite table (name, row count, columns). "
                        "Row bodies are loaded on demand from the Raw Tables page.",
@@ -321,6 +329,20 @@ def materialise_indexes(case_data: Dict[str, Any], timeline: List[Dict[str, Any]
         for fname, prefs in (case_data.get("shared_prefs", {}).get("prefs", {}) or {}).items()
         if isinstance(prefs, dict)
         for key, value in prefs.items()
+    ]
+    idx["deleted_records"] = [
+        {"database": r.get("database"),
+         "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
+         "confidence": r.get("confidence"), "partial": r.get("partial"),
+         "truncated": r.get("truncated"), "ambiguous": r.get("ambiguous"),
+         "pool": r.get("pool"), "page": r.get("page"),
+         "file_offset": r.get("file_offset"), "source_file": r.get("source_file"),
+         # One searchable blob so `deleted_records | search "..."` reaches the
+         # recovered content regardless of which table the row came from.
+         "recovered_text": " ".join(str(v) for v in (r.get("row") or {}).values()
+                                    if v is not None),
+         **{k: v for k, v in (r.get("row") or {}).items() if v is not None}}
+        for r in (case_data.get("deleted_records", {}).get("records", []) or [])
     ]
     idx["raw_tables"] = [
         {"database": db_name, "table": tname,

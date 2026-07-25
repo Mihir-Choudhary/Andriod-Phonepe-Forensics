@@ -167,6 +167,34 @@ PROVENANCE: Dict[str, Dict[str, Any]] = {
             "merchant / type / domains / updated_at": "config.json (merchantName, microAppType, whitelistedDomains) + manifest.json + nirvanaApplicationInfo.json",
         },
     },
+    "deleted_records": {
+        "source": "phonepe_forensics/carver.py — freed pages, released cells, page slack, "
+                  "WAL frames and rollback-journal pre-images of every carved database",
+        "fields": {
+            "recovery method": "Unallocated space is scanned for SQLite record headers; "
+                               "candidates are matched to a table by column count and column "
+                               "affinity, then DISCARDED if the same row is still present in "
+                               "the live table (a stale page copy is not a deletion).",
+            "pools": "freelist (released page) · freeblock (released cell in a live page) · "
+                     "page-slack (a page's unallocated middle) · pre-wal-image / "
+                     "wal-superseded (a page version the WAL replaced) · journal (rollback "
+                     "pre-image). Each record records its pool, page number and byte offset.",
+            "partial / confidence": "Freeing a cell writes a 4-byte freeblock header over the "
+                                    "record's start, taking its first serial type. Such rows are "
+                                    "marked `partial`; the lost field's boundary is solved for "
+                                    "and the value reported as reconstructed. Confidence is "
+                                    "`high` only where the record's extent was confirmed "
+                                    "structurally (intact header, or an end abutting the next "
+                                    "freed cell), `medium` where boundaries were inferred.",
+            "ambiguity": "A record whose shape fits several tables is reported against ALL of "
+                         "them and flagged ambiguous — never silently assigned to one.",
+            "negative result": "An empty recovery is NOT evidence that nothing was deleted. "
+                               "Freed space is reused over time and secure_delete zeroes it on "
+                               "deletion. Whether freed content survived is reported from what "
+                               "was recovered, not from PRAGMA secure_delete (per-connection, "
+                               "so it describes the examining build, not the phone).",
+        },
+    },
     "encrypted_dbs": {
         "source": "databases/ files with a SQLiteCrypt/SQLCipher header",
         "fields": {

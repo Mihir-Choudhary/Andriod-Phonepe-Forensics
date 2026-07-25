@@ -148,6 +148,29 @@ def export_payment_infra_csv(case_data: Dict[str, Any], out_dir: str) -> List[st
     return [a, b]
 
 
+def export_deleted_records_csv(case_data: Dict[str, Any], out_dir: str) -> str:
+    records = (case_data.get("deleted_records", {}) or {}).get("records", [])
+    rows = [{
+        "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
+        "confidence": r.get("confidence"),
+        "partial": r.get("partial"),
+        "truncated": r.get("truncated"),
+        "ambiguous": r.get("ambiguous"),
+        "pool": r.get("pool"),
+        "database": r.get("database"),
+        "source_file": r.get("source_file"),
+        "page": r.get("page"),
+        "file_offset": r.get("file_offset"),
+        "type_lost_for": "; ".join(r.get("lost_leading_columns") or []),
+        "recovered_values": json.dumps(r.get("row", {}), default=str),
+    } for r in records]
+    path = os.path.join(out_dir, "recovered_deleted_records.csv")
+    _write_csv(path, ["table", "confidence", "partial", "truncated", "ambiguous", "pool",
+                      "database", "source_file", "page", "file_offset", "type_lost_for",
+                      "recovered_values"], rows)
+    return path
+
+
 def export_timeline_csv(timeline: List[Dict[str, Any]], out_dir: str) -> str:
     path = os.path.join(out_dir, "unified_timeline.csv")
     cols = ["when_iso", "source", "kind", "title", "amount_inr", "link_id"]
@@ -359,6 +382,32 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
             _table(case_data["travel"]["journeys"][:30],
                    ["name", "type", "state", "namespace", "created_at"])))
 
+    # Recovered deleted records
+    deleted = case_data.get("deleted_records", {}) or {}
+    drecs = deleted.get("records", [])
+    if drecs:
+        dsum = deleted.get("summary", {})
+        rows = [{
+            "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
+            "confidence": r.get("confidence"),
+            "pool": r.get("pool"),
+            "provenance": f"{r.get('source_file')} page {r.get('page')} @ {r.get('file_offset')}",
+            "recovered": "; ".join(f"{k}={v}" for k, v in (r.get("row") or {}).items()
+                                   if v is not None)[:400],
+        } for r in drecs[:200]]
+        parts.append(_section(
+            f"Recovered Deleted Records ({dsum.get('recovered_count', len(drecs))})",
+            "<p class='muted'>Rows carved from freed pages, released cells, WAL frames and "
+            "rollback journals — data the app deleted that the database had not yet "
+            "overwritten. Each is a <b>reconstruction</b>, excluded from the live tables and "
+            "listed only where it is absent from them. <b>Confidence</b> is high where the "
+            "record's extent was confirmed structurally and medium where field boundaries "
+            "were inferred. An empty result is not proof nothing was deleted: freed space is "
+            "reused over time, and secure_delete zeroes it immediately.</p>"
+            + (f"<p class='muted'>Showing the first 200 of {len(drecs)}; the full set is in "
+               f"recovered_deleted_records.csv.</p>" if len(drecs) > 200 else "")
+            + _table(rows, ["table", "confidence", "pool", "provenance", "recovered"])))
+
     # Findings
     findings = case_data.get("findings", [])
     if findings:
@@ -476,6 +525,8 @@ def export_all(case_data: Dict[str, Any], out_dir: str, timeline: List[Dict[str,
     out["files"].extend(export_contacts_csv(case_data, out_dir))
     out["files"].extend(export_chat_csv(case_data, out_dir))
     out["files"].extend(export_payment_infra_csv(case_data, out_dir))
+    if (case_data.get("deleted_records", {}) or {}).get("records"):
+        out["files"].append(export_deleted_records_csv(case_data, out_dir))
     if timeline is not None:
         out["files"].append(export_timeline_csv(timeline, out_dir))
     if social_graph is not None:

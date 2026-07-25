@@ -2061,6 +2061,76 @@ def load_raw_table(paths: AndroidCasePaths, db_name: str, table: str,
             "has_more": offset + len(rows) < (total if isinstance(total, int) else 0)}
 
 
+# ---- deleted-record recovery ----
+
+# Tables worth carving, per database. Restricting the target list keeps the scan
+# proportionate and the results interpretable: these are the tables whose loss
+# changes an investigation's conclusions.
+_CARVE_TARGETS = {
+    "phonepe_core": [
+        "chatMessage", "transaction_core", "topicMember", "chatTopic",
+        "contactConnectionInfo", "phone_contacts", "vpa_contacts",
+        "phone_book_contacts", "ledger_expense", "ledger_expense_member",
+        "paymentProfileCache",
+    ],
+    "inference_data_provider": ["sms_buffer"],
+}
+
+
+def extract_deleted_records(paths: AndroidCasePaths) -> Dict[str, Any]:
+    """Recover rows deleted from the acquisition's databases.
+
+    Reported as evidence in its own right, separate from the live tables, and
+    never merged into them: a carved record is a reconstruction and has to stay
+    visibly distinguishable from a row the database still holds.
+    """
+    from phonepe_forensics.carver import SQLiteCarver
+
+    out: Dict[str, Any] = {"databases": {}, "records": [], "summary": {}, "errors": []}
+    if not paths.databases_dir:
+        out["errors"].append("databases/ not found")
+        return out
+
+    total = 0
+    by_table: Counter = Counter()
+    by_pool: Counter = Counter()
+    for db_path in paths.all_sqlites():
+        name = os.path.basename(db_path)
+        targets = _CARVE_TARGETS.get(name)
+        if targets is None:
+            continue
+        try:
+            carver = SQLiteCarver(db_path, db_path + "-wal", db_path + "-journal")
+            result = carver.carve(tables=targets)
+        except Exception as exc:
+            out["errors"].append(f"{name}: {exc}")
+            continue
+        for rec in result["records"]:
+            rec["database"] = name
+            by_table[rec.get("table") or "ambiguous"] += 1
+            by_pool[rec["pool"]] += 1
+        out["records"].extend(result["records"])
+        out["databases"][name] = {"summary": result["summary"], "notes": result["notes"]}
+        total += result["summary"]["recovered_count"]
+        for note in result["notes"]:
+            if "skipped" in note or "unreadable" in note:
+                out["errors"].append(f"{name}: {note}")
+
+    retained = {n: d["summary"].get("freed_content_retained")
+                for n, d in out["databases"].items()}
+    out["summary"] = {
+        "recovered_count": total,
+        "by_table": dict(by_table),
+        "by_pool": dict(by_pool),
+        "databases_carved": sorted(out["databases"]),
+        "freed_content_retained": retained,
+        "high_confidence": sum(1 for r in out["records"] if r["confidence"] == "high"),
+        "partial": sum(1 for r in out["records"] if r["partial"]),
+        "ambiguous": sum(1 for r in out["records"] if r["ambiguous"]),
+    }
+    return out
+
+
 # ---- explicit record of encrypted DBs that CANNOT be read offline ----
 
 def extract_encrypted_dbs(paths: AndroidCasePaths) -> Dict[str, Any]:
