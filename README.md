@@ -104,6 +104,53 @@ Bank-SMS corroboration matches **exact paise**, within ±30 minutes, one-to-one,
 time first — so a transaction cannot be credited to an SMS belonging to a different payment
 of a similar amount, and the confirmed/uncorroborated counts do not depend on row order.
 
+## Deleted-record recovery
+
+Deleting a row does not erase it. SQLite unlinks the cell and returns its bytes to one of
+four pools, all of which usually still hold the original payload. The **Deleted Records**
+page walks all four and reconstructs what it finds:
+
+| Pool | What it is |
+|---|---|
+| `freelist` | whole pages released back to the database |
+| `freeblock` | a released cell inside a live page |
+| `page-slack` | a page's unallocated middle |
+| `pre-wal-image` / `wal-superseded` | a page version the WAL replaced — where a WAL-recorded deletion leaves the original row intact |
+| `journal` | a rollback journal pre-image |
+
+Recovered rows are matched against the real table schemas by column count and affinity,
+then **excluded if they are still present in the live table**, so only genuine deletions are
+reported. Each carries its pool, page, byte offset and source file.
+
+Two honesty constraints are built in. A record that fits more than one table is reported
+against **all** of them and flagged ambiguous rather than assigned to one. And because
+freeing a cell overwrites the record's first serial type, some rows are recovered with their
+leading field's boundary *inferred* — those are marked `partial`, and confidence is only
+`high` where the record's extent was confirmed structurally.
+
+An empty result is never presented as proof that nothing was deleted: freed space is reused
+over time, and a device with `secure_delete` on zeroes it immediately. Whether freed content
+survived is reported from what was actually recovered, not from `PRAGMA secure_delete` —
+that pragma is per-connection and would describe the examining machine, not the phone.
+
+## Layout
+
+```
+phonepe_forensics/
+  core/common.py    SQLiteReader, evidence snapshots, timestamps, hashing
+  core/ios.py       plist, binarycookies, NSKeyedArchiver, iOS containers
+  core/android.py   com.phonepe.app layout, JSON payloads, shared_prefs
+  carver.py         deleted-record recovery
+  correlator.py     timeline, social graph, corroboration, findings
+  hunt.py           PPQL
+phonepe_android/    Android extractors + case orchestration
+```
+
+`core` is split by platform so the shared engine stays maintainable in one place and this
+build can take upstream fixes without vendoring a private copy. `phonepe_forensics.core`
+re-exports everything, so `from phonepe_forensics.core import X` works regardless of which
+module `X` lives in.
+
 ## Limitations
 
 - Three databases are **SQLiteCrypt-encrypted** (`AccountAggregatorDatabase`, `mdb`, and a

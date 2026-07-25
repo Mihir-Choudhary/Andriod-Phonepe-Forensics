@@ -67,11 +67,7 @@
     <div class="mlabel">Transactions</div>
     <div class="mvalue">{{ dashboard.metrics.transactions }}</div>
     <div class="msub">
-      {% if dashboard.v2.available and dashboard.v2.coverage %}
-        union: Transactions {{ dashboard.v2.coverage.txnstore_payments }} · Chat-only {{ dashboard.v2.coverage.burble_only }} · overlap {{ dashboard.v2.coverage.overlap }}
-      {% else %}
-        {{ dashboard.earliest_txn|ts }} → {{ dashboard.latest_txn|ts }}
-      {% endif %}
+      {{ dashboard.earliest_txn|ts }} → {{ dashboard.latest_txn|ts }}
     </div>
   </div>
   <div class="metric">
@@ -110,76 +106,6 @@
   </div>
 </div>
 
-{% if dashboard.v2.available %}
-<div class="metric-grid" style="margin-top:14px">
-  <div class="metric">
-    <div class="mlabel">QR / Scan payments</div>
-    <div class="mvalue">{{ dashboard.v2.qr_scan_count }}</div>
-    <div class="msub">NPCI codes 01/02/04/05 (gallery + camera + bharat-QR)</div>
-  </div>
-  <div class="metric">
-    <div class="mlabel">UPI Intent</div>
-    <div class="mvalue">{{ dashboard.v2.intent_count }}</div>
-    <div class="msub">context.initiationMode=INTENT (deeplink calls)</div>
-  </div>
-  <div class="metric">
-    <div class="mlabel">Failed payments</div>
-    <div class="mvalue {% if dashboard.v2.failures_count %}neg{% endif %}">{{ dashboard.v2.failures_count }}</div>
-    <div class="msub">{{ dashboard.v2.failures_count - dashboard.v2.failures_chat_only }} from Transactions · {{ dashboard.v2.failures_chat_only }} chat-only</div>
-  </div>
-  <div class="metric">
-    <div class="mlabel">Refunds</div>
-    <div class="mvalue">{{ dashboard.v2.refunds_count }}</div>
-    <div class="msub">incoming with from.type=MERCHANT</div>
-  </div>
-  <div class="metric">
-    <div class="mlabel">Mandates / requests</div>
-    <div class="mvalue">{{ dashboard.v2.mandates_count }}</div>
-    <div class="msub">autopay + collect requests + enrichment</div>
-  </div>
-  <div class="metric">
-    <div class="mlabel">Raw records</div>
-    <div class="mvalue">{{ dashboard.metrics.transactions + dashboard.v2.mandates_count }}</div>
-    <div class="msub">decoded + provenance</div>
-  </div>
-</div>
-
-{% if dashboard.v2.owner_vpas %}
-<div class="card" style="margin-top:14px">
-  <div class="card-title">Owner VPA fan-out
-    <span class="muted small" style="float:right">
-      {% set pp_count = dashboard.v2.owner_vpas|selectattr('is_phonepe_psp')|list|length %}
-      {{ pp_count }} on PhonePe-PSP · {{ dashboard.v2.owner_vpas|length - pp_count }} on other apps · same BARB account
-    </span>
-  </div>
-  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
-    {% for v in dashboard.v2.owner_vpas %}
-      <span class="tag mono {% if v.is_phonepe_psp %}info{% else %}med{% endif %}"
-            title="psp={{ v.psp }} bank_id={{ v.bank_id or '?' }} ifsc={{ v.ifsc or '?' }}">{{ v.vpa }}</span>
-    {% endfor %}
-  </div>
-</div>
-{% endif %}
-
-{% if dashboard.v2.by_app %}
-<div class="card" style="margin-top:14px">
-  <div class="card-title">App attribution (sender + receiver)
-    <span class="muted small" style="float:right">authoritative from ConfigManagerKeyStore.tpapKeyMap (no inference)</span>
-  </div>
-  <table>
-    <thead><tr><th>App</th><th class="right">Count</th></tr></thead>
-    <tbody>
-      {% for app, n in (dashboard.v2.by_app.items() | sort(attribute=1, reverse=true)) %}
-        <tr>
-          <td>{{ app }}</td>
-          <td class="right mono">{{ n }}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</div>
-{% endif %}
-{% endif %}
 
 <div class="card" style="margin-top:18px">
   <div class="card-title">Money Flow by Year</div>

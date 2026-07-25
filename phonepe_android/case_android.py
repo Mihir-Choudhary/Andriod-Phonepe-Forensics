@@ -16,9 +16,8 @@ the Android-specific pieces:
     run_full_extraction   → run the Android extractors
     validate              → Android layout validation
 
-``dashboard()`` is inherited unchanged: it already degrades gracefully when ``self.data['_v2']``
-is absent (returns ``{"available": False}``). ``_tag_chat_self_direction`` is normalized-data
-logic and is reused as-is once chat extraction is added.
+``dashboard()`` is inherited unchanged — it reads only the normalized contract.
+``_tag_chat_self_direction`` is normalized-data logic and is reused as-is.
 """
 from __future__ import annotations
 
@@ -53,6 +52,8 @@ def _rupees_to_paise(value: Any) -> Optional[int]:
 class AndroidCase(Case):
     """In-memory container for one PhonePe Android acquisition."""
 
+    PATHS_CLASS = AndroidCasePaths
+
     EXTRACTORS = [
         ("transactions", aex.extract_transactions),
         ("identity", aex.extract_identity),
@@ -77,6 +78,7 @@ class AndroidCase(Case):
         ("shared_prefs", aex.extract_shared_prefs),   # all 176 shared_prefs/*.xml
         ("raw_tables", aex.extract_raw_tables),       # every row of every readable SQLite table
         ("encrypted_dbs", aex.extract_encrypted_dbs), # explicit record of unreadable encrypted DBs
+        ("deleted_records", aex.extract_deleted_records),  # carved from freed space + WAL
     ]
 
     def __init__(self, root: str):
@@ -224,6 +226,31 @@ class AndroidCase(Case):
         if dev.get("is_rooted") is True:
             out.append({"severity": "high", "category": "rooted_device",
                         "title": "Device is rooted", "detail": {"model": dev.get("device_model")}})
+        deleted = self.data.get("deleted_records", {})
+        recovered = (deleted.get("summary") or {}).get("recovered_count") or 0
+        if recovered:
+            by_table = (deleted["summary"].get("by_table") or {})
+            headline = ", ".join(f"{n} {t}" for t, n in
+                                 sorted(by_table.items(), key=lambda kv: -kv[1])[:3])
+            # Deletion is the finding — what was removed, and from where.
+            out.append({
+                "severity": "high", "category": "recovered_deleted_records",
+                "title": f"{recovered} deleted record(s) recovered from freed space "
+                         f"({headline})",
+                "detail": {k: deleted["summary"][k] for k in
+                           ("by_table", "by_pool", "high_confidence", "partial", "ambiguous")
+                           if k in deleted["summary"]},
+            })
+        carved_dbs = (deleted.get("summary") or {}).get("databases_carved") or []
+        if carved_dbs and not recovered:
+            out.append({
+                "severity": "info", "category": "no_deleted_records_recovered",
+                "title": f"No deleted records were recoverable from {len(carved_dbs)} "
+                         f"database(s) — not evidence that nothing was deleted",
+                "detail": {"databases": carved_dbs,
+                           "note": "Freed space is reused over time, and a device with "
+                                   "secure_delete enabled zeroes it on deletion."},
+            })
         enc = self.data.get("encrypted_dbs", {}).get("encrypted", [])
         if enc:
             out.append({"severity": "info", "category": "encrypted_databases",

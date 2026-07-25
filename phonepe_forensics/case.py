@@ -25,8 +25,7 @@ from . import __version__ as TOOL_VERSION
 from .reports import TOOL_NAME
 
 from .core import (
-    CasePaths, evidence_manifest, evidence_warnings, hash_file, normalize_timestamp,
-    schema_gaps,
+    evidence_manifest, evidence_warnings, hash_file, normalize_timestamp, schema_gaps,
 )
 from .correlator import (
     build_corroboration_index,
@@ -43,14 +42,28 @@ from .reports import export_all
 # ---------------------------------------------------------------------------
 
 class Case:
-    """In-memory container for one forensic acquisition."""
+    """In-memory container for one forensic acquisition.
 
-    # Base Case is platform-agnostic; concrete platforms (e.g. AndroidCase) define
-    # their own EXTRACTORS and override run_full_extraction.
+    Platform-agnostic: every derived view below reads only the normalized
+    contract in ``self.data``. A concrete platform supplies its own path
+    resolver and extractors — the base class no longer defaults to the iOS
+    layout, which made "generic" code quietly Apple-shaped.
+    """
+
+    #: Path resolver for this platform. Subclasses set it (AndroidCasePaths, …).
+    PATHS_CLASS: Any = None
+
+    #: (name, fn) pairs run in order by run_full_extraction.
     EXTRACTORS: List = []
 
     def __init__(self, root: str):
-        self._init_state(root, CasePaths(os.path.abspath(root)))
+        paths_class = self.PATHS_CLASS
+        if paths_class is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must set PATHS_CLASS (or override __init__) "
+                f"— Case itself is platform-neutral and has no layout of its own."
+            )
+        self._init_state(root, paths_class(os.path.abspath(root)))
 
     def _init_state(self, root: str, paths: Any, **meta) -> None:
         """Shared construction for every platform.
@@ -263,9 +276,6 @@ class Case:
             "findings_count": len(self.findings()),
             "extraction_errors": self.extraction_errors(),
             "evidence_warnings": evidence_warnings(),
-            # The v2 enrichment layer is not part of this build; the tiles behind
-            # it stay switched off rather than reporting zeros as findings.
-            "v2": {"available": False},
         }
 
     # ---- export ----

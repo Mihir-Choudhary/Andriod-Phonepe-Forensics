@@ -91,6 +91,11 @@
     <div class="nav-section">Media</div>
     <a href="{{ url_for('page_media') }}" class="nav-item">◳ QR & Backgrounds & DPs</a>
 
+    <div class="nav-section">Recovery</div>
+    {% if platform == 'android' %}
+    <a href="{{ url_for('page_deleted') }}" class="nav-item">⌦ Deleted Records</a>
+    {% endif %}
+
     <div class="nav-section">Raw Data</div>
     {% if platform == 'android' %}
     <a href="{{ url_for('page_raw_tables') }}" class="nav-item">{ } All Tables (raw)</a>
