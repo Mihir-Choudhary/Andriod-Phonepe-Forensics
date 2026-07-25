@@ -409,7 +409,10 @@ class SQLiteReader:
             return sql, missing
         self.missing_columns.setdefault(table, []).extend(s.strip('"') for s in missing)
         _record_schema_gap(self.path, table, (s.strip('"') for s in missing))
-        rebuilt = f'SELECT {", ".join(kept)} FROM "{table}"{m.group("rest") or ""}'
+        # Quote the kept names: a column called `rank`, `filter` or `key` parses
+        # fine in the original text but not always once we re-emit it.
+        quoted = ", ".join('"%s"' % c.strip('"') for c in kept)
+        rebuilt = f'SELECT {quoted} FROM "{table}"{m.group("rest") or ""}'
         return rebuilt, missing
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:

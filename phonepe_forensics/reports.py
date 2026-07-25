@@ -15,6 +15,7 @@ import datetime as _dt
 import html
 import json
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import __version__ as TOOL_VERSION
@@ -40,12 +41,16 @@ def _ts_text(epoch_ms: Any) -> str:
 # the examiner's workstation when they open the CSV.
 _CSV_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
 
+# A plain signed number is not a formula, and quoting it would turn every
+# negative amount in an export into text a spreadsheet will not sum.
+_PLAIN_NUMBER_RX = re.compile(r"^[+-]?\d+(\.\d+)?$")
+
 
 def csv_safe(value: Any) -> Any:
     """Neutralise spreadsheet formula injection in one cell, losslessly."""
     if not isinstance(value, str) or not value:
         return value
-    if value[0] in _CSV_FORMULA_LEADERS:
+    if value[0] in _CSV_FORMULA_LEADERS and not _PLAIN_NUMBER_RX.match(value):
         return "'" + value
     return value
 

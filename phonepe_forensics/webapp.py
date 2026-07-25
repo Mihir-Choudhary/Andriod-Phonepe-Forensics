@@ -462,7 +462,7 @@ def _load_raw_table(case: Case, db: str, table: str, offset: int, limit: int) ->
 @app.route("/raw-tables/<db>/<table>")
 def page_raw_table_browse(db: str, table: str):
     case = _active()
-    offset = _int_arg("offset", 0)
+    offset = _int_arg("offset", 0, maximum=RAW_TABLE_CSV_CAP * 100)
     page = _load_raw_table(case, db, table, offset, RAW_TABLE_PAGE_SIZE)
     if page.get("error"):
         abort(404)
@@ -1011,7 +1011,8 @@ def page_audit():
                            audit=case.data.get("audit", {}),
                            extraction_errors=case.extraction_errors(),
                            evidence_warnings=case.evidence_warnings(),
-                           manifest=case.evidence_manifest())
+                           manifest=case.evidence_manifest(),
+                           case_root=case.root)
 
 
 @app.route("/timeline")
@@ -1279,23 +1280,10 @@ def _err_500(e):
 
 
 
-@app.route("/avatar/<phone>")
-def page_avatar(phone: str):
-    """Avatar bytes for a phone. Android acquisitions do not store local profile
-    photos keyed by phone (the contacts table holds remote URLs only), so this
-    returns 404 and the UI falls back to initials. Kept as an endpoint so the
-    templates' <img> tags resolve."""
-    return abort(404)
-
-
-@app.route("/app-icon/<icon_id>.png")
-def page_app_icon(icon_id: str):
-    """Return an app icon PNG (PhonePe / GPay / Paytm / Cred / Amazon Pay)."""
-    from pathlib import Path
-    p = Path(__file__).parent / "static" / "logos" / "apps" / f"{icon_id}.png"
-    if not p.exists():
-        return abort(404)
-    return Response(p.read_bytes(), mimetype="image/png")
+# /avatar and /app-icon are gone. Android acquisitions store no local profile
+# photos keyed by phone (the contacts table holds remote URLs only) and no icon
+# assets ship with the tool, so both endpoints could only ever 404 — one request
+# per contact, per page load. The templates render initials directly instead.
 
 
 

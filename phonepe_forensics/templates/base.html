@@ -5,9 +5,12 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{% block title %}PhonePe Forensics{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+{# No remote assets. This is an offline forensic tool examining a subject's
+   financial and social history, so it must not reach a third party on every
+   page load — that leaks when and where an examination is running, and stalls
+   on an air-gapped workstation. The stylesheet's font stack already falls back
+   to system faces. #}
+<link rel="icon" href="data:,">
 </head>
 <body class="dark{% if ui_platform %} platform-{{ ui_platform }}{% endif %}">
 <div class="layout">

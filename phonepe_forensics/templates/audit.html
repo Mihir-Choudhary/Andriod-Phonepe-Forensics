@@ -19,7 +19,7 @@
   {% if extraction_errors %}
   <p class="muted small">Every module failure, degradation and schema gap seen while
      parsing this acquisition. A view backed by one of these is incomplete, not empty.</p>
-  <table class="data">
+  <table>
     <thead><tr><th>Severity</th><th>Module / DB</th><th>Detail</th></tr></thead>
     <tbody>
       {% for e in extraction_errors %}
@@ -42,15 +42,20 @@
      <span class="mono">-wal</span>/<span class="mono">-shm</span> sidecars. Evidence is never
      written to: databases carrying a WAL are recovered against a scratch copy, the rest are
      opened <span class="mono">immutable</span> in place.</p>
-  <table class="data">
+  <div style="overflow-x:auto">
+  <table>
     <thead><tr><th>Database</th><th>SHA-256</th><th>Opened via</th><th>WAL</th><th>Sidecars</th></tr></thead>
     <tbody>
       {% for m in manifest %}
       <tr>
-        <td class="mono small">{{ m.original }}</td>
+        <td class="mono small" title="{{ m.original }}">{{ m.original.split('/')[-1] }}</td>
         <td class="mono small">{{ m.sha256 }}</td>
         <td class="small">{{ m.opened_via }}</td>
-        <td class="small">{% if m.wal_present %}{{ 'applied' if m.wal_applied else 'EXCLUDED' }}{% else %}none{% endif %}</td>
+        <td class="small">
+          {% if m.wal_present %}
+            {% if m.wal_applied %}applied{% else %}<span class="tag neg">EXCLUDED</span>{% endif %}
+          {% else %}none{% endif %}
+        </td>
         <td class="mono small">
           {% for k, v in m.sidecar_hashes.items() %}{{ k }}={{ v[:16] }}…<br>{% endfor %}
         </td>
@@ -58,6 +63,10 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
+  <p class="muted small" style="margin-top:8px">
+    Evidence root: <span class="mono">{{ case_root }}</span>
+  </p>
 </div>
 
 <div class="metric-grid">

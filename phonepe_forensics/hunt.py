@@ -64,6 +64,7 @@ Examples:
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -618,7 +619,6 @@ def _group_key(value: Any) -> Any:
     """A hashable key for grouping/dedup. Several indexed fields hold decoded JSON
     (dicts and lists), which cannot go into a set or a Counter."""
     if isinstance(value, (dict, list, set, tuple, bytearray)):
-        import json
         try:
             return json.dumps(value, default=str, sort_keys=True)
         except Exception:
@@ -724,7 +724,6 @@ def _full_text_match(rec: Dict[str, Any], term: str) -> bool:
             continue
         if isinstance(v, (dict, list)):
             try:
-                import json
                 if needle in json.dumps(v, default=str).lower():
                     return True
             except Exception:

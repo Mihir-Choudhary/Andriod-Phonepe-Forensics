@@ -153,6 +153,16 @@ timeline | where source = "Chat"
       </div>
 
       <div class="hunt-help-section">
+        <div class="hunt-help-title">Timestamps</div>
+        <div class="muted small">
+          Every <span class="mono">*_iso</span> field is UTC ISO-8601, e.g.
+          <span class="mono">2025-06-15T15:06:40+00:00</span>, so string comparison sorts
+          chronologically: <span class="mono">where created_at_iso &gt; "2025-06-15"</span>.
+          Each also has a numeric <span class="mono">*_epoch_ms</span> twin.
+        </div>
+      </div>
+
+      <div class="hunt-help-section">
         <div class="hunt-help-title">Indexes</div>
         {% for idx in indexes_help %}
         <div class="hunt-index-entry">

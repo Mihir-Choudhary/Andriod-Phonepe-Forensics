@@ -280,11 +280,15 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
     nodes: Dict[str, Dict[str, Any]] = {}
 
     contacts = case_data.get("contacts", {})
-    for c in contacts.get("cyclops_contacts", []):
-        node_id = (c.get("phone") or c.get("external_vpa") or c.get("connect_id") or "?").strip()
+    for pos, c in enumerate(contacts.get("cyclops_contacts", [])):
+        identifier = (c.get("phone") or c.get("external_vpa") or c.get("connect_id") or "").strip()
+        # A contact with no phone, VPA or connection id is still a distinct person.
+        # Keying them all on a shared placeholder merged every unidentifiable
+        # contact into one node carrying the first one's name.
+        node_id = identifier or f"unidentified::{pos}"
         node = nodes.get(node_id) or {
             "node_id": node_id,
-            "kind": "CONTACT",
+            "kind": "CONTACT" if identifier else "CONTACT_UNIDENTIFIED",
             "name": c.get("verified_name") or c.get("external_vpa_name"),
             "phone": c.get("phone"),
             "vpa": c.get("external_vpa"),
@@ -689,15 +693,18 @@ def detect_suspicious_signals(case_data: Dict[str, Any]) -> List[Dict[str, Any]]
             "detail": {"count": len(high_fail)},
         })
 
-    # Single-source transactions (no chat/reward corroboration)
+    # Payments referenced somewhere in the app but absent from the master ledger —
+    # a chat card or reward whose transaction_core row is gone is worth a look.
     corr = build_corroboration_index(case_data)
-    one_source = [it for it in corr["items"] if it["corroboration_score"] == 1 and "Transactions" not in it["sources"]]
+    one_source = [it for it in corr["items"]
+                  if it["corroboration_score"] == 1 and "Transactions" not in it["sources"]]
     if one_source:
         findings.append({
             "severity": "medium",
             "category": "uncorroborated_transactions",
-            "title": f"{len(one_source)} txn IDs only seen outside the master ledger",
-            "detail": {"sample": one_source[:5]},
+            "title": f"{len(one_source)} payment(s) referenced only outside the master ledger "
+                     f"(no matching transaction_core row)",
+            "detail": {"count": len(one_source), "sample": one_source[:5]},
         })
 
     # Wallet balance > 0 (relevant to investigation scope)
