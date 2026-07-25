@@ -5,6 +5,61 @@
 
 {% block content %}
 
+{% if evidence_warnings %}
+<div class="card" style="margin-bottom:18px;border-left:4px solid #f87171">
+  <div class="card-title">⚠ Evidence integrity warnings</div>
+  <ul style="margin:8px 0 0 18px">
+    {% for w in evidence_warnings %}<li class="mono small">{{ w }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="card" style="margin-bottom:18px">
+  <div class="card-title">Extraction health ({{ extraction_errors|length }} problem(s))</div>
+  {% if extraction_errors %}
+  <p class="muted small">Every module failure, degradation and schema gap seen while
+     parsing this acquisition. A view backed by one of these is incomplete, not empty.</p>
+  <table class="data">
+    <thead><tr><th>Severity</th><th>Module / DB</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for e in extraction_errors %}
+      <tr>
+        <td><span class="tag {% if e.severity == 'failed' %}neg{% else %}med{% endif %}">{{ e.severity }}</span></td>
+        <td class="mono">{{ e.module }}</td>
+        <td class="small">{{ e.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted small">Every extractor completed and every requested column was present.</p>
+  {% endif %}
+</div>
+
+<div class="card" style="margin-bottom:18px">
+  <div class="card-title">Acquisition hash manifest ({{ manifest|length }} database(s))</div>
+  <p class="muted small">SHA-256 taken before any parsing, covering each database and its
+     <span class="mono">-wal</span>/<span class="mono">-shm</span> sidecars. Evidence is never
+     written to: databases carrying a WAL are recovered against a scratch copy, the rest are
+     opened <span class="mono">immutable</span> in place.</p>
+  <table class="data">
+    <thead><tr><th>Database</th><th>SHA-256</th><th>Opened via</th><th>WAL</th><th>Sidecars</th></tr></thead>
+    <tbody>
+      {% for m in manifest %}
+      <tr>
+        <td class="mono small">{{ m.original }}</td>
+        <td class="mono small">{{ m.sha256 }}</td>
+        <td class="small">{{ m.opened_via }}</td>
+        <td class="small">{% if m.wal_present %}{{ 'applied' if m.wal_applied else 'EXCLUDED' }}{% else %}none{% endif %}</td>
+        <td class="mono small">
+          {% for k, v in m.sidecar_hashes.items() %}{{ k }}={{ v[:16] }}…<br>{% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
 <div class="metric-grid">
   <div class="metric"><div class="mlabel">Ledger syncs</div><div class="mvalue">{{ audit.summary.ledger_sync_count }}</div></div>
   <div class="metric"><div class="mlabel">Central syncs</div><div class="mvalue">{{ audit.summary.central_sync_count }}</div></div>

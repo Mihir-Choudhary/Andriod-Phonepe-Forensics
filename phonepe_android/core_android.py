@@ -22,9 +22,13 @@ from typing import Any, Dict, List, Optional
 
 # Reuse the platform-agnostic primitives unchanged.
 from phonepe_forensics.core import (  # noqa: F401  (re-exported for extractors)
+    EPOCH_S_MAX,
     SQLiteReader,
+    _ts_dict,
     amount_to_rupees,
     decode_txn_id,
+    evidence_manifest,
+    evidence_warnings,
     hash_file,
     normalize_timestamp,
     safe_float,
@@ -65,20 +69,14 @@ def decode_json_blob(value: Any) -> Any:
 
 def chromium_ts(utc: Any) -> Optional[Dict[str, Any]]:
     """Chromium/WebKit timestamps are microseconds since 1601-01-01. Convert to the
-    normalized ts-dict shape {epoch_ms, iso, display, source}. Returns None on 0/invalid."""
-    from datetime import datetime, timezone
+    normalized ts-dict shape {epoch_ms, iso, display, tz, source}. None on 0/invalid."""
     n = safe_int(utc, default=0)
     if n <= 0:
         return None
     epoch_s = n / 1_000_000.0 - 11_644_473_600.0  # 1601→1970 offset
-    if epoch_s <= 0:
+    if epoch_s <= 0 or epoch_s > EPOCH_S_MAX:
         return None
-    try:
-        dt = datetime.fromtimestamp(epoch_s, tz=timezone.utc)
-    except (OSError, ValueError, OverflowError):
-        return None
-    s = dt.strftime("%Y-%m-%d %H:%M:%S")
-    return {"epoch_ms": int(epoch_s * 1000), "iso": s, "display": s, "source": "chromium_webkit"}
+    return _ts_dict(epoch_s, "chromium_webkit")
 
 
 def first_or_dict(v: Any) -> Dict[str, Any]:

@@ -15,18 +15,56 @@ import datetime as _dt
 import html
 import json
 import os
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
+
+from . import __version__ as TOOL_VERSION
+
+TOOL_NAME = "PhonePe Android Forensics"
+
+
+def _ts_text(epoch_ms: Any) -> str:
+    try:
+        return _dt.datetime.fromtimestamp(
+            int(epoch_ms) / 1000.0, tz=_dt.timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "—"
 
 # ---------------------------------------------------------------------------
 # CSV writers
 # ---------------------------------------------------------------------------
+
+# Leading characters that make a spreadsheet treat a cell as a formula rather
+# than as text. Counterparty names, chat notes and SMS bodies are all controlled
+# by the suspect, so an unescaped export turns evidence into code that runs on
+# the examiner's workstation when they open the CSV.
+_CSV_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection in one cell, losslessly."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] in _CSV_FORMULA_LEADERS:
+        return "'" + value
+    return value
+
+
+def safe_filename(name: str, fallback: str = "export.csv") -> str:
+    """Strip anything that could break out of a Content-Disposition header or a
+    path. Werkzeug rejects headers containing newlines outright (a 500), and a
+    quote or slash would let a caller-supplied id rewrite the filename."""
+    cleaned = "".join(c for c in str(name or "") if c.isalnum() or c in "-_. ").strip()
+    cleaned = cleaned.lstrip(".")
+    return cleaned[:120] or fallback
+
 
 def _write_csv(path: str, fieldnames: List[str], rows: Iterable[Dict[str, Any]]):
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in rows:
-            writer.writerow({k: _stringify(r.get(k)) for k in fieldnames})
+            writer.writerow({k: csv_safe(_stringify(r.get(k))) for k in fieldnames})
 
 
 def _stringify(v: Any) -> str:
@@ -180,7 +218,9 @@ small{{color:#6b7280}}
 <body>
 <header>
 <h1>PhonePe Android Forensics — Evidence Report</h1>
-<p>Generated {generated} · Case: {case_root}</p>
+<p>{case_name} · Generated {generated} · {tool}</p>
+<p>Evidence root: {case_root}</p>
+<p>All timestamps are UTC.</p>
 </header>
 <main>
 {body}
@@ -189,8 +229,57 @@ small{{color:#6b7280}}
 """
 
 
-def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str = "") -> str:
+def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str = "",
+                       custody: Optional[Dict[str, Any]] = None) -> str:
     parts: List[str] = []
+    custody = custody or {}
+
+    # Chain of custody — first section, because a deliverable that cannot say
+    # which acquisition it describes, who produced it, with what tool version, or
+    # what the source hashes were is not usable as an exhibit.
+    meta = case_data.get("_meta", {}) or {}
+    parts.append(_section("Chain of Custody", _kv_block({
+        "Case name": custody.get("case_name") or "—",
+        "Case ID": custody.get("case_id") or "—",
+        "Investigator": custody.get("investigator") or "—",
+        "Evidence root": case_root or meta.get("case_root") or "—",
+        "Platform": meta.get("platform", "android"),
+        "Tool": f"{TOOL_NAME} {TOOL_VERSION}",
+        "Extraction started": _ts_text(meta.get("loaded_at")),
+        "Extraction completed": _ts_text(meta.get("completed_at")),
+        "Report generated": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Notes": custody.get("notes") or "—",
+    })))
+
+    manifest = custody.get("manifest") or []
+    if manifest:
+        parts.append(_section(
+            f"Acquisition Hash Manifest ({len(manifest)} database(s))",
+            "<p class='muted'>SHA-256 computed before any parsing. Databases carrying a "
+            "write-ahead log are recovered against a scratch copy so WAL-resident records "
+            "are included; the evidence files themselves are never written to.</p>"
+            + _table([{
+                "database": m.get("original"),
+                "sha256": m.get("sha256"),
+                "opened_via": m.get("opened_via"),
+                "wal": ("applied" if m.get("wal_applied")
+                        else "EXCLUDED" if m.get("wal_present") else "none"),
+                "sidecars": "; ".join(f"{k}={v}" for k, v in (m.get("sidecar_hashes") or {}).items()) or "—",
+            } for m in manifest],
+                ["database", "sha256", "opened_via", "wal", "sidecars"])))
+
+    warnings = custody.get("evidence_warnings") or []
+    if warnings:
+        parts.append(_section("Evidence Integrity Warnings", _table(
+            [{"warning": w} for w in warnings], ["warning"])))
+
+    problems = custody.get("extraction_errors") or []
+    if problems:
+        parts.append(_section(
+            f"Extraction Problems ({len(problems)})",
+            "<p class='muted'>Modules that failed or degraded. Any section below that "
+            "is backed by one of these is incomplete rather than empty.</p>"
+            + _table(problems, ["severity", "module", "detail"])))
 
     # Identity
     ident = case_data.get("identity", {})
@@ -277,7 +366,9 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
 
     body = "\n".join(parts)
     html_doc = _HTML_REPORT_TMPL.format(
-        generated=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        generated=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        case_name=html.escape(str(custody.get("case_name") or "Unnamed case")),
+        tool=html.escape(f"{TOOL_NAME} {TOOL_VERSION}"),
         case_root=html.escape(case_root or "—"),
         body=body,
     )
@@ -366,9 +457,15 @@ def _money(v: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def export_all(case_data: Dict[str, Any], out_dir: str, timeline: List[Dict[str, Any]] = None,
-               social_graph: Dict[str, Any] = None, case_root: str = "") -> Dict[str, Any]:
+               social_graph: Dict[str, Any] = None, case_root: str = "",
+               custody: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     os.makedirs(out_dir, exist_ok=True)
     out: Dict[str, Any] = {"directory": out_dir, "files": []}
+    if custody:
+        manifest_path = os.path.join(out_dir, "chain_of_custody.json")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(custody, fh, default=str, indent=2)
+        out["files"].append(manifest_path)
     out["files"].append(export_master_json(case_data, out_dir))
     out["files"].append(export_transactions_csv(case_data, out_dir))
     out["files"].extend(export_contacts_csv(case_data, out_dir))
@@ -378,5 +475,5 @@ def export_all(case_data: Dict[str, Any], out_dir: str, timeline: List[Dict[str,
         out["files"].append(export_timeline_csv(timeline, out_dir))
     if social_graph is not None:
         out["files"].append(export_social_graph_csv(social_graph, out_dir))
-    out["files"].append(export_html_report(case_data, out_dir, case_root))
+    out["files"].append(export_html_report(case_data, out_dir, case_root, custody=custody))
     return out

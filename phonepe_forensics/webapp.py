@@ -15,9 +15,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
+import secrets
 import sys
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from flask import (
     Flask, Response, abort, jsonify, redirect, render_template, request,
@@ -26,8 +29,11 @@ from flask import (
 
 from .case import Case
 from .case_manager import manager
+from .reports import csv_safe, safe_filename
 from . import hunt
 
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # App
@@ -40,12 +46,44 @@ app.config["JSON_SORT_KEYS"] = False
 # edits only appear after a full server restart.
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
-app.secret_key = os.environ.get("PP_FORENSICS_SECRET", "phonepe-forensics-local-dev")
+# A shipped default secret is a known signing key, so anyone can forge a session
+# cookie for a workstation that never set the env var. Fall back to a per-process
+# random key instead: sessions then end with the process, which for a local
+# single-analyst tool is the right trade.
+app.secret_key = os.environ.get("PP_FORENSICS_SECRET") or secrets.token_hex(32)
 
 # ── Android build ───────────────────────────────────────────────────────────
 # Fully-Android distribution: there is no platform picker and every case is an
 # Android acquisition. The flag is read by the routes/context-processor below.
 ANDROID_ONLY = True
+
+
+# ---------------------------------------------------------------------------
+# Request guards
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def _guard_state_changing_requests():
+    """Reject cross-origin state changes.
+
+    The server binds to localhost, but any page the analyst has open in the same
+    browser can POST to it. Without this check a visited web page could delete
+    the case registry or pop the evidence-folder chooser on the workstation.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    referer = request.headers.get("Referer")
+    source = origin or referer
+    if not source:
+        # No Origin on a same-origin form post from some older clients; a request
+        # with neither header cannot have come from a cross-site fetch.
+        return None
+    parsed = urlsplit(source)
+    if f"{parsed.hostname}:{parsed.port}" != f"{urlsplit(request.host_url).hostname}:{urlsplit(request.host_url).port}":
+        log.warning("Rejected cross-origin %s %s from %s", request.method, request.path, source)
+        return jsonify({"ok": False, "error": "cross-origin request rejected"}), 403
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +95,18 @@ def _active() -> Case:
     if case is None:
         abort(503, description="No case is currently loaded.")
     return case
+
+
+def _int_arg(name: str, default: int, minimum: int = 0, maximum: int = 1_000_000) -> int:
+    """Read an integer query parameter without letting `?limit=abc` become a 500."""
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _safe_get(d: Any, *path, default=None) -> Any:
@@ -105,10 +155,6 @@ def _inject():
     case = manager.get_active_case()
     if case:
         ident = case.data.get("identity", {})
-        # Prefer v2 union count (Transactions + Chat) when available, otherwise
-        # fall back to upstream extractor's count.
-        v2 = case.data.get("_v2") or {}
-        v2_total = (v2.get("coverage") or {}).get("combined_unique")
         _plat = (case.data.get("_meta") or {}).get("platform", "android")
         return {
             "case_loaded": True,
@@ -123,7 +169,7 @@ def _inject():
             "subject_name": ident.get("registered_name"),
             "subject_upi": ident.get("upi_id"),
             "nav_metrics": {
-                "transactions": v2_total if v2_total is not None else _safe_get(case.data, "transactions", "summary", "transaction_count", default=0),
+                "transactions": _safe_get(case.data, "transactions", "summary", "transaction_count", default=0),
                 "messages": _safe_get(case.data, "chat", "summary", "message_count", default=0),
                 "contacts": _safe_get(case.data, "contacts", "summary", "phonebook_total", default=0),
                 "findings": len(case.findings()),
@@ -162,26 +208,44 @@ def _csv_response(rows: List[Dict[str, Any]], columns: List[str], filename: str)
                 v = v.get("iso") or v.get("display") or json.dumps(v, default=str)
             elif isinstance(v, (list, tuple)):
                 v = "; ".join(str(x) for x in v)
-            out[c] = v if v is not None else ""
+            out[c] = csv_safe(v if v is not None else "")
         writer.writerow(out)
     return Response(
         buf.getvalue(),
         mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename(filename)}"'},
     )
+
+
+def _row_blob(row: Dict[str, Any]) -> str:
+    """Lower-cased searchable text for one row.
+
+    Scalars are stringified directly and only nested structures go through
+    json.dumps; serialising every row in full was the dominant cost of filtering
+    a large table, and most columns are scalars.
+    """
+    parts = []
+    for v in row.values():
+        if v is None:
+            continue
+        if isinstance(v, (dict, list, tuple, set)):
+            parts.append(json.dumps(v, default=str))
+        else:
+            parts.append(str(v))
+    return " ".join(parts).lower()
 
 
 def _filter_table(rows: List[Dict[str, Any]], q: str = "", filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """Server-side table filter: full-text + per-column equals."""
-    if not q and not filters:
+    active_filters = {k: v for k, v in (filters or {}).items() if v}
+    if not q and not active_filters:
         return rows
     needle = q.lower().strip() if q else None
+    filters = active_filters
     out = []
     for r in rows:
-        if needle:
-            blob = json.dumps(r, default=str).lower()
-            if needle not in blob:
-                continue
+        if needle and needle not in _row_blob(r):
+            continue
         if filters:
             ok = True
             for k, v in filters.items():
@@ -386,11 +450,33 @@ def page_raw_tables():
                            encrypted=case.data.get("encrypted_dbs", {}))
 
 
+RAW_TABLE_PAGE_SIZE = 500
+RAW_TABLE_CSV_CAP = 100_000
+
+
+def _load_raw_table(case: Case, db: str, table: str, offset: int, limit: int) -> Dict[str, Any]:
+    from phonepe_android.extractors_android import load_raw_table
+    return load_raw_table(case.paths, db, table, offset=offset, limit=limit)
+
+
+@app.route("/raw-tables/<db>/<table>")
+def page_raw_table_browse(db: str, table: str):
+    case = _active()
+    offset = _int_arg("offset", 0)
+    page = _load_raw_table(case, db, table, offset, RAW_TABLE_PAGE_SIZE)
+    if page.get("error"):
+        abort(404)
+    return render_template("raw_table_detail.html", page=page)
+
+
 @app.route("/raw-tables/<db>/<table>.csv")
 def page_raw_table_csv(db: str, table: str):
     case = _active()
-    rows = _safe_get(case.data, "raw_tables", "databases", db, table, "rows", default=[])
-    cols = sorted({k for r in rows for k in r.keys()}) if rows else []
+    page = _load_raw_table(case, db, table, 0, RAW_TABLE_CSV_CAP)
+    if page.get("error"):
+        abort(404)
+    rows = page["rows"]
+    cols = page["columns"] or sorted({k for r in rows for k in r.keys()})
     return _csv_response(rows, cols, f"{db}.{table}.csv")
 
 
@@ -572,7 +658,11 @@ def page_transaction_detail(txn_id: str):
     for t in case.data.get("transactions", {}).get("transactions", []):
         if t.get("global_payment_id") == txn_id or t.get("entity_id") == txn_id:
             corr = case.corroboration()
-            corr_entry = next((it for it in corr["items"] if it["txn_id"] in (t.get("global_payment_id"), t.get("entity_id"))), None)
+            # Match on the entry's full alias set: a payment's identifiers are all
+            # folded onto one entry, and txn_id is only the first of them.
+            wanted = {str(x) for x in (t.get("global_payment_id"), t.get("entity_id")) if x}
+            corr_entry = next((it for it in corr["items"]
+                               if wanted & set(it.get("aliases") or [it["txn_id"]])), None)
             related_chat = []
             for m in case.data.get("chat", {}).get("messages", []):
                 if t.get("global_payment_id") and m.get("transaction_id") == t.get("global_payment_id"):
@@ -725,7 +815,10 @@ def export_chat_group_csv(group_id: str):
     cols = ["created_at", "type", "sender_name", "sender_phone_masked",
             "receiver_name", "amount_inr", "transaction_id", "utr", "state",
             "instrument", "note", "text_message"]
-    return _csv_response(msgs, cols, f"chat_thread_{group_id[:8]}.csv")
+    # group_id comes straight off the URL; unsanitised it can inject a newline or
+    # a quote into Content-Disposition, which Werkzeug refuses to serialise.
+    slug = safe_filename(group_id[:16], fallback="thread")
+    return _csv_response(msgs, cols, f"chat_thread_{slug}.csv")
 
 
 @app.route("/chat/<group_id>")
@@ -913,25 +1006,29 @@ def export_webkit_domains_csv():
 
 @app.route("/audit")
 def page_audit():
-    return render_template("audit.html", audit=_active().data.get("audit", {}))
+    case = _active()
+    return render_template("audit.html",
+                           audit=case.data.get("audit", {}),
+                           extraction_errors=case.extraction_errors(),
+                           evidence_warnings=case.evidence_warnings(),
+                           manifest=case.evidence_manifest())
 
 
 @app.route("/timeline")
 def page_timeline():
     case = _active()
-    limit = int(request.args.get("limit", 1500))
+    limit = _int_arg("limit", 1500, minimum=1)
     q = request.args.get("q", "")
     src = request.args.get("source", "")
-    events = case.timeline(limit=limit)
-    if q or src:
-        events = _filter_table(events, q=q, filters={"source": src})
-    return render_template("timeline.html", events=events, q=q, src=src, total=len(case.timeline(limit=limit)))
+    all_events = case.timeline(limit=limit)
+    events = _filter_table(all_events, q=q, filters={"source": src}) if (q or src) else all_events
+    return render_template("timeline.html", events=events, q=q, src=src, total=len(all_events))
 
 
 @app.route("/timeline/export.csv")
 def export_timeline_csv():
     case = _active()
-    rows = case.timeline(limit=int(request.args.get("limit", 5000)))
+    rows = case.timeline(limit=_int_arg("limit", 5000, minimum=1))
     rows = _filter_table(rows, q=request.args.get("q", ""), filters={"source": request.args.get("source", "")})
     cols = ["when_iso", "source", "kind", "title", "amount_inr", "link_id"]
     return _csv_response(rows, cols, "unified_timeline.csv")
@@ -955,6 +1052,19 @@ def page_db_browser():
                            inventory=case.data.get("database_inventory", []))
 
 
+SQL_ROW_LIMIT = 1000
+
+
+def _case_database_paths(case: Case) -> Dict[str, str]:
+    """realpath → declared path for every database belonging to the active case."""
+    allowed: Dict[str, str] = {}
+    for entry in case.data.get("database_inventory", []) or []:
+        p = entry.get("path")
+        if p:
+            allowed[os.path.realpath(p)] = p
+    return allowed
+
+
 @app.route("/database-browser/sql", methods=["GET"])
 def page_db_sql():
     case = _active()
@@ -963,9 +1073,15 @@ def page_db_sql():
     result = None
     columns: List[str] = []
     error = None
+    truncated = False
     if db_path and sql:
+        allowed = _case_database_paths(case)
         sql_stripped = sql.strip().rstrip(";")
-        if not sql_stripped.upper().startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
+        if os.path.realpath(db_path) not in allowed:
+            # Without this the console is an arbitrary-file SQLite reader: any
+            # path on the workstation, including another investigation's case.
+            error = "That database is not part of this case."
+        elif not sql_stripped.upper().startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
             error = "Only SELECT / PRAGMA / EXPLAIN / WITH queries are allowed."
         elif ";" in sql_stripped:
             error = "Multiple statements are not allowed."
@@ -973,18 +1089,18 @@ def page_db_sql():
             try:
                 from .core import SQLiteReader
                 with SQLiteReader(db_path) as db:
-                    rows = db.query(sql_stripped + " LIMIT 1000")
-                if rows and "_error" in rows[0]:
-                    error = rows[0]["_error"]
-                else:
-                    result = rows[:1000]
-                    columns = list(result[0].keys()) if result else []
+                    # Row-capping happens at fetch time. Appending " LIMIT 1000"
+                    # to the analyst's SQL is a syntax error for PRAGMA, for
+                    # EXPLAIN, and for any query that already has its own LIMIT.
+                    result, columns, truncated = db.query_rows(
+                        sql_stripped, max_rows=SQL_ROW_LIMIT)
             except Exception as exc:
                 error = str(exc)
     return render_template("database_sql.html",
                            inventory=case.data.get("database_inventory", []),
-                           db_path=db_path, sql=sql,
-                           result=result, columns=columns, error=error)
+                           db_path=db_path, sql=sql, row_limit=SQL_ROW_LIMIT,
+                           result=result, columns=columns, error=error,
+                           truncated=truncated)
 
 
 @app.route("/counterparty")
@@ -1005,8 +1121,7 @@ def page_hunt():
     query = request.args.get("q", "")
     result = None
     if query:
-        idx = hunt.materialise_indexes(case.data, case.timeline(), case.social_graph(), case.findings())
-        result = hunt.run_query(query, idx)
+        result = hunt.run_query(query, case.hunt_indexes())
     return render_template(
         "hunt.html",
         query=query,
@@ -1021,8 +1136,7 @@ def export_hunt_csv():
     query = request.args.get("q", "")
     if not query:
         abort(400)
-    idx = hunt.materialise_indexes(case.data, case.timeline(), case.social_graph(), case.findings())
-    result = hunt.run_query(query, idx)
+    result = hunt.run_query(query, case.hunt_indexes())
     if result.get("error"):
         return _csv_response([], ["error"], "hunt_error.csv")
     cols = result["columns"] or list(result["rows"][0].keys()) if result["rows"] else ["_empty"]
@@ -1064,7 +1178,8 @@ def _existing_exports() -> List[Dict[str, Any]]:
 @app.route("/api/export", methods=["POST"])
 def api_export():
     case = _active()
-    info = case.export_all(base_dir=os.path.join(os.getcwd(), "exports"))
+    info = case.export_all(base_dir=os.path.join(os.getcwd(), "exports"),
+                           meta=manager.get_meta(manager.active_id) or {})
     return jsonify({"ok": True, **info})
 
 
@@ -1088,9 +1203,21 @@ def api_file():
         if d:
             allowed_roots.append(os.path.realpath(d))
     allowed_roots.append(os.path.realpath(os.path.join(os.getcwd(), "exports")))
-    if not any(real.startswith(r) for r in allowed_roots):
+    if not any(_is_within(real, r) for r in allowed_roots):
         abort(403)
     return send_file(real)
+
+
+def _is_within(path: str, root: str) -> bool:
+    """True when `path` is `root` or lives underneath it.
+
+    A prefix test is not containment: `/cases/acme` is a prefix of
+    `/cases/acme-OTHER`, so startswith() serves files from a sibling case.
+    """
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # different drives on Windows
+        return False
 
 
 @app.route("/api/blob")
@@ -1109,7 +1236,7 @@ def api_blob():
 
 @app.route("/api/timeline")
 def api_timeline():
-    return jsonify(_active().timeline(limit=int(request.args.get("limit", 5000))))
+    return jsonify(_active().timeline(limit=_int_arg("limit", 5000, minimum=1)))
 
 
 @app.route("/api/findings")
@@ -1122,8 +1249,7 @@ def api_hunt():
     case = _active()
     payload = request.get_json(silent=True) or {}
     query = payload.get("q", "")
-    idx = hunt.materialise_indexes(case.data, case.timeline(), case.social_graph(), case.findings())
-    return jsonify(hunt.run_query(query, idx))
+    return jsonify(hunt.run_query(query, case.hunt_indexes()))
 
 
 @app.errorhandler(503)
@@ -1138,7 +1264,13 @@ def _err_404(e):
 
 @app.errorhandler(500)
 def _err_500(e):
-    return render_template("error.html", code=500, message=str(e)), 500
+    # str(e) here is the raw exception: filesystem paths, SQL text, evidence
+    # values. Log it for the analyst's console, show the page a generic message.
+    log.exception("Unhandled error serving %s", request.path)
+    return render_template(
+        "error.html", code=500,
+        message="Internal error. See the server console for details.",
+    ), 500
 
 
 # ---------------------------------------------------------------------------

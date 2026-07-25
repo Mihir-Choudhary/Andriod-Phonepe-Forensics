@@ -25,7 +25,9 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Dict, List
+from collections import defaultdict
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 
 from phonepe_forensics.case import Case
 from phonepe_forensics.correlator import build_unified_timeline, detect_suspicious_signals
@@ -35,6 +37,17 @@ from .core_android import AndroidCasePaths
 
 _SMS_AMOUNT_RX = re.compile(r"(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", re.I)
 _SMS_FIN_RX = re.compile(r"debit|credit|sent|received|paid|withdraw|spent|txn|transaction|a/c|upi", re.I)
+
+
+def _rupees_to_paise(value: Any) -> Optional[int]:
+    """Rupee amount → integer paise. Decimal, not float: `float('0.07') * 100`
+    is 7.000000000000001, and rounding that is how an exact match silently misses."""
+    if value is None:
+        return None
+    try:
+        return int((Decimal(str(value).replace(",", "").strip()) * 100).to_integral_value())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
 
 class AndroidCase(Case):
@@ -67,20 +80,7 @@ class AndroidCase(Case):
     ]
 
     def __init__(self, root: str):
-        self.root = os.path.abspath(root)
-        self.paths = AndroidCasePaths(self.root)
-        self.data: Dict[str, Any] = {
-            "_meta": {
-                "platform": "android",
-                "case_root": self.root,
-                "loaded_at": int(time.time() * 1000),
-                "containers": self.paths.summary(),
-            },
-        }
-        self._extracted = False
-        self._timeline = None
-        self._social_graph = None
-        self._findings = None
+        self._init_state(root, AndroidCasePaths(os.path.abspath(root)), platform="android")
 
     def validate(self) -> Dict[str, Any]:
         ok = self.paths.is_valid()
@@ -118,6 +118,7 @@ class AndroidCase(Case):
 
         self._findings = detect_suspicious_signals(self.data) + self._android_findings()
         self.data["findings"] = self._findings
+        self.data["_meta"]["completed_at"] = int(time.time() * 1000)
         self._extracted = True
         return self.data
 
@@ -151,9 +152,18 @@ class AndroidCase(Case):
         return ev
 
     def sms_corroboration(self) -> Dict[str, Any]:
-        """Cross-check the transaction ledger against ingested bank SMS (amount + time window).
-        Surfaces: txns confirmed by an independent SMS, txns with no SMS (possible deletion),
-        and financial SMS with no matching txn (activity outside the app)."""
+        """Cross-check the transaction ledger against ingested bank SMS.
+
+        Surfaces: txns confirmed by an independent SMS, txns with no SMS (possible
+        deletion), and financial SMS with no matching txn (activity outside the app).
+
+        Matching is exact to the paise and one-to-one, assigned closest-in-time
+        first. The previous ±₹1 tolerance with first-match-wins could pair a
+        transaction with a different payment of a similar amount, and whichever
+        transaction happened to be iterated first claimed the SMS — so the
+        confirmed/uncorroborated counts that end up in a report depended on row
+        order rather than on the evidence.
+        """
         WINDOW_MS = 30 * 60 * 1000  # ±30 min
         txns = [t for t in self.data.get("transactions", {}).get("transactions", [])
                 if t.get("amount_inr") is not None and t.get("created_at")]
@@ -163,32 +173,48 @@ class AndroidCase(Case):
             am = _SMS_AMOUNT_RX.search(body)
             if not am or not _SMS_FIN_RX.search(body) or not m.get("received_at"):
                 continue
-            try:
-                amt = float(am.group(1).replace(",", ""))
-            except ValueError:
+            paise = _rupees_to_paise(am.group(1))
+            if paise is None:
                 continue
-            sms.append({"amt": amt, "ms": m["received_at"]["epoch_ms"],
+            sms.append({"paise": paise, "ms": m["received_at"]["epoch_ms"],
                         "sender": m.get("address"), "body": body})
-        matches, used_sms = [], set()
-        confirmed = 0
-        for t in txns:
-            tms = t["created_at"]["epoch_ms"]; tamt = t["amount_inr"]
-            hit = None
-            for i, s in enumerate(sms):
-                if i in used_sms:
-                    continue
-                if abs(s["amt"] - tamt) < 1.0 and abs(s["ms"] - tms) <= WINDOW_MS:
-                    hit = (i, s); break
-            if hit:
-                used_sms.add(hit[0]); confirmed += 1
-                matches.append({"txn_time": t["created_at"]["iso"], "amount_inr": tamt,
-                                "direction": t.get("direction"), "counterparty": t.get("counterparty"),
-                                "sms_sender": hit[1]["sender"], "sms_snippet": hit[1]["body"][:120]})
+
+        # Score every candidate pair, then assign greedily by smallest time gap so
+        # the nearest SMS wins regardless of iteration order.
+        by_paise: Dict[int, List[int]] = defaultdict(list)
+        for i, s in enumerate(sms):
+            by_paise[s["paise"]].append(i)
+        candidates = []
+        for ti, t in enumerate(txns):
+            tms = t["created_at"]["epoch_ms"]
+            tpaise = t.get("amount_paise")
+            if tpaise is None:
+                tpaise = _rupees_to_paise(t["amount_inr"])
+            if tpaise is None:
+                continue
+            for si in by_paise.get(tpaise, ()):
+                gap = abs(sms[si]["ms"] - tms)
+                if gap <= WINDOW_MS:
+                    candidates.append((gap, ti, si))
+        candidates.sort()
+
+        matches, used_sms, used_txn = [], set(), set()
+        for gap, ti, si in candidates:
+            if ti in used_txn or si in used_sms:
+                continue
+            used_txn.add(ti); used_sms.add(si)
+            t, s = txns[ti], sms[si]
+            matches.append({"txn_time": t["created_at"]["iso"], "amount_inr": t["amount_inr"],
+                            "direction": t.get("direction"), "counterparty": t.get("counterparty"),
+                            "sms_sender": s["sender"], "sms_snippet": s["body"][:120],
+                            "delta_seconds": round(gap / 1000)})
+        matches.sort(key=lambda m: m["txn_time"], reverse=True)
         return {
-            "confirmed_count": confirmed,
-            "uncorroborated_count": len(txns) - confirmed,
+            "confirmed_count": len(used_txn),
+            "uncorroborated_count": len(txns) - len(used_txn),
             "sms_only_count": len(sms) - len(used_sms),
             "financial_sms_count": len(sms),
+            "match_rule": "exact paise, ±30 min, one-to-one, nearest in time first",
             "matches": matches,
         }
 

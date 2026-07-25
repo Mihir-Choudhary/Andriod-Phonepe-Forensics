@@ -8,6 +8,33 @@
 
 {% block content %}
 
+{% if dashboard.evidence_warnings %}
+<div class="card" style="margin-bottom:18px;border-left:4px solid #f87171">
+  <div class="card-title">⚠ Evidence integrity warnings</div>
+  <ul style="margin:8px 0 0 18px">
+    {% for w in dashboard.evidence_warnings %}<li class="mono small">{{ w }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if dashboard.extraction_errors %}
+<div class="card" style="margin-bottom:18px;border-left:4px solid #fbbf24">
+  <div class="card-title">
+    ⚠ {{ dashboard.extraction_errors|length }} extraction problem(s) — some views may be incomplete
+  </div>
+  <p class="muted small" style="margin:6px 0 0">
+    A blank page below may mean the data could not be read, not that it is absent.
+    Full detail on the <a href="{{ url_for('page_audit') }}">Audit</a> page.
+  </p>
+  <ul style="margin:8px 0 0 18px">
+    {% for e in dashboard.extraction_errors[:6] %}
+      <li class="small"><span class="tag med">{{ e.severity }}</span>
+        <span class="mono">{{ e.module }}</span> — {{ e.detail }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <section class="identity-hero">
   <h2>SUBJECT IDENTITY</h2>
   <div class="row" style="justify-content:space-between;align-items:flex-end;gap:24px;flex-wrap:wrap">

@@ -16,7 +16,10 @@
       <b>Type</b><span class="mono">{{ txn.type }}</span>
       <b>Created</b><span>{{ txn.created_at|ts }}</span>
       <b>Updated</b><span>{{ txn.updated_at|ts }}</span>
-      <b>Embedded ID time</b><span class="mono">{{ txn.id_embedded_ts.embedded_iso if txn.id_embedded_ts else '—' }}</span>
+      <b>Embedded ID time</b><span class="mono" {% if txn.id_embedded_ts %}title="{{ txn.id_embedded_ts.tz_caveat }}"{% endif %}>
+        {{ txn.id_embedded_ts.embedded_wallclock if txn.id_embedded_ts else '—' }}
+        {% if txn.id_embedded_ts %}<span class="muted small">({{ txn.id_embedded_ts.tz_assumed }})</span>{% endif %}
+      </span>
       <b>Global Payment ID</b><span class="mono">{{ txn.global_payment_id }}</span>
       <b>Entity ID</b><span class="mono">{{ txn.entity_id }}</span>
       <b>Response code</b><span>{{ txn.response_code or '—' }}</span>

@@ -18,6 +18,7 @@ import os
 import shutil
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from .case import Case
@@ -64,9 +65,24 @@ def _save_registry(reg: Dict[str, Any]) -> None:
 class CaseManager:
     """Manages all known forensic cases and the currently active one."""
 
+    # A loaded case holds the whole parsed acquisition in memory. Without a bound
+    # an analyst who opens six cases in a session keeps all six resident.
+    MAX_CACHED_CASES = 3
+
     def __init__(self):
-        self._cache: Dict[str, Case] = {}
+        self._cache: "OrderedDict[str, Case]" = OrderedDict()
         self.active_id: Optional[str] = None
+
+    def _remember(self, case_id: str, case: Case) -> None:
+        self._cache[case_id] = case
+        self._cache.move_to_end(case_id)
+        while len(self._cache) > self.MAX_CACHED_CASES:
+            evicted_id, evicted_case = self._cache.popitem(last=False)
+            if evicted_id in (self.active_id, case_id):
+                # Never evict the case being viewed or the one just loaded.
+                self._cache[evicted_id] = evicted_case
+                self._cache.move_to_end(evicted_id, last=False)
+                break
 
     # ---- registry queries ----
     def list_cases(self) -> List[Dict[str, Any]]:
@@ -134,6 +150,7 @@ class CaseManager:
     def load_case(self, case_id: str, on_progress=None) -> Case:
         if case_id in self._cache:
             self.active_id = case_id
+            self._cache.move_to_end(case_id)
             return self._cache[case_id]
         meta = self.get_meta(case_id)
         if not meta:
@@ -152,8 +169,8 @@ class CaseManager:
             })
         except Exception:
             pass
-        self._cache[case_id] = case
         self.active_id = case_id
+        self._remember(case_id, case)
         return case
 
     def get_active_case(self) -> Optional[Case]:

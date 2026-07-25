@@ -27,6 +27,29 @@ workspace (no operating-system picker) and parses every case as an Android acqui
 > examine. The tool is strictly read-only, but **never commit acquisitions, generated
 > output, or the case registry** — they are excluded by `.gitignore` for this reason.
 
+### How "read-only" is enforced
+
+The evidence directory is never written to, so it works on a read-only mount and stays
+byte-identical to the manifest taken at seizure:
+
+- Every database and its `-wal` / `-shm` / `-journal` sidecars are **SHA-256 hashed before
+  parsing**. The manifest appears on the Audit page and in `chain_of_custody.json`.
+- A database with **no WAL** is opened in place with `immutable=1`, which cannot create or
+  modify a file. (SQLite's ordinary `mode=ro` cannot do this: it still needs to create a
+  `-shm` next to the database, which fails on read-only media and mutates the folder when
+  it succeeds.)
+- A database **carrying a WAL** is copied with its sidecars to a scratch directory and
+  recovered there, so WAL-resident records are included without touching the original. The
+  connection is switched to `query_only` once the schema is read.
+- If a scratch copy cannot be staged, the database is opened `immutable` in place and a
+  warning is raised on the dashboard, the Audit page and the exported report saying that
+  `-wal` content is **not** included.
+
+**All timestamps are UTC**, stated explicitly: `iso` is ISO-8601 with a `+00:00` offset and
+`display` is suffixed `UTC`. The timestamp embedded in a PhonePe transaction ID is reported
+as raw wall-clock digits and labelled *unvalidated* — the issuing server's timezone is
+undocumented, so it is not treated as independent corroboration.
+
 ---
 
 ## Quick start
@@ -71,6 +94,15 @@ identity by **exact** cross-table lookup (connection_id / member_id / last-10 ph
 against the user's own contacts, and labels **each** recovered name by origin —
 *saved in PhonePe* vs *phonebook* — so you can see both. Matches are exact only and
 ambiguous phones (mapping to more than one person) are left unresolved, never guessed.
+
+The same rule governs the social graph: chat activity is attributed by **connection id**,
+never by display name, so two different contacts who share a name keep their own threads and
+their own message counts. A thread whose counterparty cannot be resolved to a connection is
+counted against the thread and marked as such, rather than being attached to a guessed name.
+
+Bank-SMS corroboration matches **exact paise**, within ±30 minutes, one-to-one, nearest in
+time first — so a transaction cannot be credited to an SMS belonging to a different payment
+of a similar amount, and the confirmed/uncorroborated counts do not depend on row order.
 
 ## Limitations
 

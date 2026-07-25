@@ -795,6 +795,7 @@ def extract_chat(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "created_at": normalize_timestamp(r.get("createdTime") or inner.get("createdAt")),
                     "updated_at": normalize_timestamp(r.get("lastUpdated") or inner.get("updatedAt")),
                     "visible": not bool(r.get("isDeleted")),
+                    "sender_member_id": src, "receiver_member_id": dst,
                     "sender_name": sender_name, "sender_phone_masked": member_masked.get(src),
                     "sender_role": None, "sender_is_self": sender_is_self,
                     "sender_name_resolved": s_name_res, "sender_resolved_source": s_src,
@@ -1879,6 +1880,18 @@ def parse_datastore_pb(data: bytes) -> Dict[str, Any]:
 
 # ---- all files/ (index + parse JSON + DataStore protobuf) ----
 
+# Files above this are indexed but not parsed into memory. A React Native bundle
+# or a cache blob can be tens of megabytes, and every parsed document is held for
+# the lifetime of the case.
+_MAX_PARSE_BYTES = 8 * 1024 * 1024
+
+
+def _is_crashlytics_native_doc(rel: str, ext: str) -> bool:
+    """Crashlytics writes extension-less JSON under .../native/ (device.json's
+    siblings). Match those, and nothing else without an extension."""
+    return ext == "(noext)" and "/native/" in rel.replace("\\", "/")
+
+
 def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
     out: Dict[str, Any] = {"files": [], "datastore": {}, "json_docs": {}, "summary": {}, "errors": []}
     import json as _json
@@ -1887,6 +1900,7 @@ def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
         return out
     by_ext: Counter = Counter()
     total = 0
+    skipped_large = 0
     for cur, _, fl in os.walk(paths.files_dir):
         for f in sorted(fl):
             p = os.path.join(cur, f)
@@ -1898,20 +1912,31 @@ def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
             ext = os.path.splitext(f)[1].lower() or "(noext)"
             by_ext[ext] += 1; total += 1
             out["files"].append({"path": rel, "size": sz, "ext": ext})
+            if sz > _MAX_PARSE_BYTES:
+                skipped_large += 1
+                continue
             try:
                 if f.endswith(".preferences_pb"):
                     with open(p, "rb") as fh:
                         out["datastore"][rel] = parse_datastore_pb(fh.read())
-                elif f.endswith(".json") or f in ("user-data", "keys") or f.endswith(".bundle") is False and ext in ("(noext)",) and "/native/" in rel.replace("\\", "/"):
-                    txt = open(p, encoding="utf-8").read()
-                    s = txt.lstrip()
+                elif (f.endswith(".json") or f in ("user-data", "keys")
+                      or _is_crashlytics_native_doc(rel, ext)):
+                    with open(p, encoding="utf-8", errors="replace") as fh:
+                        s = fh.read().lstrip()
                     if s[:1] in "{[":
                         out["json_docs"][rel] = _json.loads(s)
             except Exception:
                 pass
     out["summary"] = {"file_count": total, "ext_breakdown": dict(by_ext),
                       "datastore_keys": sum(len(v) for v in out["datastore"].values()),
-                      "json_docs": len(out["json_docs"])}
+                      "json_docs": len(out["json_docs"]),
+                      "skipped_over_size_cap": skipped_large,
+                      "size_cap_bytes": _MAX_PARSE_BYTES}
+    if skipped_large:
+        out["errors"].append(
+            f"{skipped_large} file(s) larger than {_MAX_PARSE_BYTES // (1024 * 1024)} MB "
+            f"were indexed but not parsed."
+        )
     return out
 
 
@@ -1948,12 +1973,29 @@ _COVERED_TABLES = {
 }
 
 
-def extract_raw_tables(paths: AndroidCasePaths, row_cap: int = 100_000) -> Dict[str, Any]:
-    """Capture EVERY row of EVERY table in every readable SQLite DB (the long tail not owned by a
-    dedicated module). Guarantees no readable DB data is skipped. row_cap is a runaway backstop
-    far above any real table; if a table is ever capped it is logged in 'capped'."""
-    out: Dict[str, Any] = {"databases": {}, "capped": [], "summary": {}, "errors": []}
-    table_total = 0; row_total = 0
+def _decode_json_columns(rows: List[Dict[str, Any]]) -> None:
+    """Decode JSON-looking TEXT columns in place, for readability in the browser."""
+    for r in rows:
+        for k, v in list(r.items()):
+            if isinstance(v, str) and len(v) > 1 and v[0] in "{[" and v[-1] in "}]":
+                dec = decode_json_blob(v)
+                if isinstance(dec, (dict, list)):
+                    r[k] = dec
+
+
+def extract_raw_tables(paths: AndroidCasePaths) -> Dict[str, Any]:
+    """Inventory EVERY table in every readable SQLite DB, so nothing is silently skipped.
+
+    Only the shape is captured here — database, table, row count, columns. Row
+    bodies are read on demand by ``load_raw_table``, because materialising every
+    row of a 160-table acquisition held hundreds of megabytes in memory for the
+    lifetime of the case, most of it a second copy of rows the dedicated
+    extractors had already parsed.
+    """
+    out: Dict[str, Any] = {"databases": {}, "summary": {}, "errors": []}
+    table_total = 0
+    row_total = 0
+    duplicated = 0
     for db_path in paths.all_sqlites():
         name = os.path.basename(db_path)
         db_entry: Dict[str, Any] = {}
@@ -1964,25 +2006,55 @@ def extract_raw_tables(paths: AndroidCasePaths, row_cap: int = 100_000) -> Dict[
                         continue
                     n = db.count(t)
                     table_total += 1
-                    rows = db.query(f'SELECT * FROM "{t}" LIMIT {row_cap}')
-                    if isinstance(n, int) and n > row_cap:
-                        out["capped"].append({"db": name, "table": t, "rows": n, "captured": row_cap})
-                    # JSON-decode obvious JSON-string columns for usability
-                    for r in rows:
-                        for k, v in list(r.items()):
-                            if isinstance(v, str) and len(v) > 1 and v[0] in "{[" and v[-1] in "}]":
-                                dec = decode_json_blob(v)
-                                if isinstance(dec, (dict, list)):
-                                    r[k] = dec
-                    row_total += len(rows)
-                    db_entry[t] = {"row_count": n, "rows": rows}
+                    if isinstance(n, int) and n > 0:
+                        row_total += n
+                    covered = t in _COVERED_TABLES
+                    if covered:
+                        duplicated += 1
+                    db_entry[t] = {
+                        "row_count": n,
+                        "columns": db.columns(t),
+                        "path": db_path,
+                        # Tables a dedicated extractor already parses into a
+                        # curated view; still browsable, just flagged as such.
+                        "covered_by_module": covered,
+                    }
         except Exception as exc:
             db_entry["_error"] = str(exc)
+            out["errors"].append(f"{name}: {exc}")
         out["databases"][name] = db_entry
     out["summary"] = {"database_count": len(out["databases"]), "table_count": table_total,
-                      "row_total": row_total, "covered_by_dedicated_modules": len(_COVERED_TABLES),
-                      "capped_tables": len(out["capped"])}
+                      "row_total": row_total,
+                      "covered_by_dedicated_modules": duplicated,
+                      "lazy": True}
     return out
+
+
+def load_raw_table(paths: AndroidCasePaths, db_name: str, table: str,
+                   offset: int = 0, limit: int = 500) -> Dict[str, Any]:
+    """Read one page of one raw table, on demand.
+
+    `db_name` and `table` are matched against the acquisition's real inventory
+    rather than interpolated blindly, so a crafted request cannot reach a file
+    outside the case or a name outside the schema.
+    """
+    limit = max(1, min(int(limit), 5000))
+    offset = max(0, int(offset))
+    db_path = next((p for p in paths.all_sqlites() if os.path.basename(p) == db_name), None)
+    if not db_path:
+        return {"error": f"unknown database: {db_name}", "rows": [], "columns": []}
+    with SQLiteReader(db_path) as db:
+        if table not in db.tables():
+            return {"error": f"unknown table: {table}", "rows": [], "columns": []}
+        total = db.count(table)
+        rows = db.query(f'SELECT * FROM "{table}" LIMIT ? OFFSET ?', (limit, offset))
+        if rows and "_error" in rows[0]:
+            return {"error": rows[0]["_error"], "rows": [], "columns": []}
+        _decode_json_columns(rows)
+        columns = db.columns(table)
+    return {"database": db_name, "table": table, "columns": columns, "rows": rows,
+            "row_count": total, "offset": offset, "limit": limit,
+            "has_more": offset + len(rows) < (total if isinstance(total, int) else 0)}
 
 
 # ---- explicit record of encrypted DBs that CANNOT be read offline ----
