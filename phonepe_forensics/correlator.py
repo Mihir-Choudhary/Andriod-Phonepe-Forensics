@@ -276,17 +276,19 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     by_phone: Dict[str, Dict[str, Any]] = {}
     by_vpa: Dict[str, Dict[str, Any]] = {}
+    by_connection: Dict[str, Dict[str, Any]] = {}
     nodes: Dict[str, Dict[str, Any]] = {}
 
     contacts = case_data.get("contacts", {})
     for c in contacts.get("cyclops_contacts", []):
         node_id = (c.get("phone") or c.get("external_vpa") or c.get("connect_id") or "?").strip()
-        node = {
+        node = nodes.get(node_id) or {
             "node_id": node_id,
             "kind": "CONTACT",
             "name": c.get("verified_name") or c.get("external_vpa_name"),
             "phone": c.get("phone"),
             "vpa": c.get("external_vpa"),
+            "connection_id": c.get("connect_id"),
             "on_phonepe": c.get("on_phonepe"),
             "upi_state": c.get("upi_state"),
             "txn_count_in": 0,
@@ -295,15 +297,26 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
             "txn_total_out": 0.0,
             "chat_message_count": 0,
             "chat_payment_count": 0,
+            "chat_payment_total_inr": 0.0,
             "first_seen_iso": None,
             "last_seen_iso": None,
             "evidence_sources": ["phone_contacts"],
         }
+        # Several contact tables can describe the same person; fill gaps rather
+        # than letting the last row seen overwrite a better-populated one.
+        for key, val in (("name", c.get("verified_name") or c.get("external_vpa_name")),
+                         ("vpa", c.get("external_vpa")),
+                         ("connection_id", c.get("connect_id")),
+                         ("upi_state", c.get("upi_state"))):
+            if val and not node.get(key):
+                node[key] = val
         nodes[node_id] = node
         if c.get("phone"):
-            by_phone[c["phone"]] = node
+            by_phone.setdefault(c["phone"], node)
         if c.get("external_vpa"):
-            by_vpa[c["external_vpa"]] = node
+            by_vpa.setdefault(c["external_vpa"], node)
+        if c.get("connect_id"):
+            by_connection.setdefault(c["connect_id"], node)
 
     # Phonebook backfill (full names for unmatched phones)
     for p in contacts.get("phonebook_contacts", []):
@@ -323,10 +336,12 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
                 "name": p.get("full_name"),
                 "phone": normalized,
                 "vpa": None,
+                "connection_id": None,
                 "on_phonepe": False,
                 "txn_count_in": 0, "txn_count_out": 0,
                 "txn_total_in": 0.0, "txn_total_out": 0.0,
                 "chat_message_count": 0, "chat_payment_count": 0,
+                "chat_payment_total_inr": 0.0,
                 "first_seen_iso": None, "last_seen_iso": None,
                 "evidence_sources": ["Phonebook"],
             }
@@ -345,10 +360,12 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
                 "name": cp_name,
                 "phone": cp_phone,
                 "vpa": cp_vpa,
+                "connection_id": None,
                 "on_phonepe": None,
                 "txn_count_in": 0, "txn_count_out": 0,
                 "txn_total_in": 0.0, "txn_total_out": 0.0,
                 "chat_message_count": 0, "chat_payment_count": 0,
+                "chat_payment_total_inr": 0.0,
                 "first_seen_iso": None, "last_seen_iso": None,
                 "evidence_sources": ["Transactions"],
             })
@@ -377,57 +394,113 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
             if not node["last_seen_iso"] or iso > node["last_seen_iso"]:
                 node["last_seen_iso"] = iso
 
-    # Chat messages mapped to groups; group name often = counterparty name
+    # Chat messages, attributed by connection id.
+    #
+    # Display names are NOT identities: two contacts can share a name, and keying
+    # chat activity on the name collapses both threads onto whichever node was
+    # built last. Every chat member carries a connectionId (public_id) that is the
+    # same identifier a contact row exposes as connect_id, so that is the join.
+    # A message whose counterparty cannot be resolved to a connection is bucketed
+    # by its thread and reported as thread-only rather than guessed onto a name.
     chat = case_data.get("chat", {})
     groups_by_id = {g.get("group_id"): g for g in chat.get("groups", [])}
+    member_conn: Dict[Any, str] = {}
+    member_display: Dict[Any, str] = {}
+    for mem in chat.get("members", []):
+        mid = mem.get("internal_id")
+        if mid is None:
+            continue
+        if mem.get("public_id"):
+            member_conn.setdefault(mid, mem["public_id"])
+        if mem.get("display_name"):
+            member_display.setdefault(mid, mem["display_name"])
+    # Threads with exactly one non-self member are 1:1, so every message in them
+    # belongs to that connection even when the message rows carry no member id.
+    solo_conn_by_thread: Dict[Any, str] = {}
+    solo_name_by_thread: Dict[Any, str] = {}
+    members_by_thread: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for mem in chat.get("members", []):
+        members_by_thread[mem.get("group_id")].append(mem)
+    for thread, mems in members_by_thread.items():
+        others = [m for m in mems if not m.get("is_self")]
+        if len(others) == 1 and others[0].get("public_id"):
+            solo_conn_by_thread[thread] = others[0]["public_id"]
+            solo_name_by_thread[thread] = others[0].get("display_name")
+
     chat_buckets: Dict[str, Dict[str, Any]] = {}
     for m in chat.get("messages", []):
         thread = m.get("thread_id")
-        g = groups_by_id.get(thread)
-        cp_name = g.get("name") if g else thread
-        if not cp_name:
-            continue
-        bucket = chat_buckets.setdefault(cp_name, {"messages": 0, "payments": 0, "amount": 0.0})
+        other_member = (m.get("receiver_member_id") if m.get("sender_is_self") is True
+                        else m.get("sender_member_id") if m.get("sender_is_self") is False
+                        else None)
+        conn = member_conn.get(other_member) if other_member is not None else None
+        if not conn:
+            conn = solo_conn_by_thread.get(thread)
+        if conn:
+            key, resolved = f"conn::{conn}", True
+            label = member_display.get(other_member) or solo_name_by_thread.get(thread)
+        else:
+            if not thread:
+                continue
+            key, resolved = f"thread::{thread}", False
+            g = groups_by_id.get(thread)
+            label = (g or {}).get("name") or thread
+        bucket = chat_buckets.setdefault(key, {
+            "messages": 0, "payments": 0, "amount": 0.0,
+            "connection_id": conn, "resolved": resolved, "label": label,
+        })
+        if not bucket.get("label") and label:
+            bucket["label"] = label
         bucket["messages"] += 1
         if m.get("type") == "PAYMENT_INFO_CARD":
             bucket["payments"] += 1
             bucket["amount"] += m.get("amount_inr") or 0.0
 
-    # Merge chat data into nodes (matching by name where possible)
-    name_to_node = {n["name"]: n for n in nodes.values() if n.get("name")}
-    for cp_name, b in chat_buckets.items():
-        node = name_to_node.get(cp_name)
+    for key, b in chat_buckets.items():
+        node = by_connection.get(b["connection_id"]) if b["connection_id"] else None
         if not node:
-            node = nodes.setdefault(f"chat::{cp_name}", {
-                "node_id": f"chat::{cp_name}",
-                "kind": "CHAT_DERIVED",
-                "name": cp_name, "phone": None, "vpa": None,
+            node = nodes.setdefault(f"chat::{key}", {
+                "node_id": f"chat::{key}",
+                "kind": "CHAT_DERIVED" if b["resolved"] else "CHAT_THREAD_ONLY",
+                "name": b.get("label"), "phone": None, "vpa": None,
+                "connection_id": b["connection_id"],
                 "on_phonepe": True,
                 "txn_count_in": 0, "txn_count_out": 0,
                 "txn_total_in": 0.0, "txn_total_out": 0.0,
                 "chat_message_count": 0, "chat_payment_count": 0,
+                "chat_payment_total_inr": 0.0,
                 "first_seen_iso": None, "last_seen_iso": None,
                 "evidence_sources": ["Chat"],
             })
+            if not b["resolved"]:
+                node["attribution_note"] = (
+                    "Thread has no resolvable connection id; counted against the thread, "
+                    "not matched to a contact."
+                )
         if "Chat" not in node["evidence_sources"]:
             node["evidence_sources"].append("Chat")
-        node["chat_message_count"] = b["messages"]
-        node["chat_payment_count"] = b["payments"]
-        node["chat_payment_total_inr"] = round(b["amount"], 2)
+        node["chat_message_count"] = node.get("chat_message_count", 0) + b["messages"]
+        node["chat_payment_count"] = node.get("chat_payment_count", 0) + b["payments"]
+        node["chat_payment_total_inr"] = round(
+            (node.get("chat_payment_total_inr") or 0.0) + b["amount"], 2)
 
     nodes_list = list(nodes.values())
     nodes_list.sort(
-        key=lambda n: (n.get("txn_count_in") + n.get("txn_count_out") + n.get("chat_message_count") / 5),
+        key=lambda n: (n.get("txn_count_in", 0) + n.get("txn_count_out", 0)
+                       + n.get("chat_message_count", 0) / 5),
         reverse=True,
     )
     return {
         "nodes": nodes_list,
         "summary": {
             "total_nodes": len(nodes_list),
-            "with_transactions": sum(1 for n in nodes_list if (n["txn_count_in"] + n["txn_count_out"]) > 0),
-            "with_chat": sum(1 for n in nodes_list if n["chat_message_count"] > 0),
+            "with_transactions": sum(1 for n in nodes_list
+                                     if (n.get("txn_count_in", 0) + n.get("txn_count_out", 0)) > 0),
+            "with_chat": sum(1 for n in nodes_list if n.get("chat_message_count", 0) > 0),
             "phone_index_size": len(by_phone),
             "vpa_index_size": len(by_vpa),
+            "connection_index_size": len(by_connection),
+            "chat_threads_unattributed": sum(1 for b in chat_buckets.values() if not b["resolved"]),
         },
     }
 
@@ -437,58 +510,109 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
-    """For each transaction ID, list every database that references it.
+    """For each *transaction*, list every place in the acquisition that references it.
 
-    A transaction with high corroboration (>3 sources) is highly trustworthy.
-    A transaction with only 1 source — especially if the source is non-canonical
-    (e.g. Chat notification only) — may indicate tampering.
+    One real payment carries several identifiers — the global payment id, the
+    local entity id, the id echoed in a chat card. They are aliases, so they are
+    folded onto a single entry: counting them separately would report one payment
+    as two uncorroborated transactions.
+
+    A payment referenced by several independent sources is well corroborated. One
+    seen only outside the master ledger (e.g. a chat card with no matching
+    transaction_core row) is worth a look — it can mean the ledger row was deleted.
     """
-    index: Dict[str, Dict[str, Any]] = {}
+    entries: List[Dict[str, Any]] = []
+    by_alias: Dict[str, Dict[str, Any]] = {}
+
+    def _entry_for(alias_ids: List[Any], **seed) -> Dict[str, Any]:
+        """Find (or create) the entry owning any of these ids, and merge the rest in."""
+        aliases = [str(a) for a in alias_ids if a]
+        if not aliases:
+            return {}
+        found = None
+        for a in aliases:
+            hit = by_alias.get(a)
+            if hit is not None and hit is not found:
+                if found is None:
+                    found = hit
+                else:
+                    # Two entries turn out to be the same payment — merge them.
+                    found["aliases"].update(hit["aliases"])
+                    found["sources"].update(hit["sources"])
+                    for k in ("amount_inr", "counterparty", "earliest_iso"):
+                        if found.get(k) is None:
+                            found[k] = hit.get(k)
+                    for a2 in hit["aliases"]:
+                        by_alias[a2] = found
+                    if hit in entries:
+                        entries.remove(hit)
+        if found is None:
+            found = {
+                "txn_id": aliases[0],
+                "aliases": set(),
+                "sources": set(),
+                "amount_inr": seed.get("amount_inr"),
+                "counterparty": seed.get("counterparty"),
+                "earliest_iso": None,
+            }
+            entries.append(found)
+        found["aliases"].update(aliases)
+        for a in aliases:
+            by_alias[a] = found
+        return found
 
     for t in case_data.get("transactions", {}).get("transactions", []):
-        for tid in (t.get("global_payment_id"), t.get("entity_id")):
-            if not tid:
-                continue
-            entry = index.setdefault(tid, {
-                "txn_id": tid,
-                "sources": [],
-                "amount_inr": t.get("amount_inr"),
-                "counterparty": t.get("counterparty"),
-                "earliest_iso": None,
-            })
-            entry["sources"].append("Transactions")
-            if t.get("created_at") and (
-                entry["earliest_iso"] is None or t["created_at"]["iso"] < entry["earliest_iso"]
-            ):
-                entry["earliest_iso"] = t["created_at"]["iso"]
+        entry = _entry_for(
+            [t.get("global_payment_id"), t.get("entity_id")],
+            amount_inr=t.get("amount_inr"), counterparty=t.get("counterparty"),
+        )
+        if not entry:
+            continue
+        entry["sources"].add("Transactions")
+        if entry.get("amount_inr") is None:
+            entry["amount_inr"] = t.get("amount_inr")
+        if entry.get("counterparty") is None:
+            entry["counterparty"] = t.get("counterparty")
+        ts = t.get("created_at")
+        if ts and (entry["earliest_iso"] is None or ts["iso"] < entry["earliest_iso"]):
+            entry["earliest_iso"] = ts["iso"]
 
     for m in case_data.get("chat", {}).get("messages", []):
-        for tid in (m.get("transaction_id"), m.get("receiver_txn_id"), m.get("sender_txn_id")):
-            if not tid:
-                continue
-            entry = index.setdefault(tid, {"txn_id": tid, "sources": [], "amount_inr": m.get("amount_inr"), "counterparty": None, "earliest_iso": None})
-            entry["sources"].append("Chat")
-            if m.get("amount_inr") and not entry.get("amount_inr"):
-                entry["amount_inr"] = m["amount_inr"]
+        entry = _entry_for(
+            [m.get("transaction_id"), m.get("receiver_txn_id"), m.get("sender_txn_id")],
+            amount_inr=m.get("amount_inr"),
+        )
+        if not entry:
+            continue
+        entry["sources"].add("Chat")
+        if entry.get("amount_inr") is None:
+            entry["amount_inr"] = m.get("amount_inr")
 
     for r in case_data.get("financial", {}).get("rewards", []):
-        tid = r.get("linked_transaction")
-        if not tid:
-            continue
-        entry = index.setdefault(tid, {"txn_id": tid, "sources": [], "amount_inr": None, "counterparty": None, "earliest_iso": None})
-        entry["sources"].append("Rewards")
+        entry = _entry_for([r.get("linked_transaction")])
+        if entry:
+            entry["sources"].add("Rewards")
 
-    items = list(index.values())
-    for it in items:
-        it["sources"] = sorted(set(it["sources"]))
+    for e in case_data.get("ledger", {}).get("expenses", []):
+        entry = _entry_for([e.get("settlement_txn_id")], amount_inr=e.get("amount_inr"))
+        if entry:
+            entry["sources"].add("Ledger")
+
+    items = []
+    for it in entries:
+        it["sources"] = sorted(it["sources"])
+        it["aliases"] = sorted(it["aliases"])
         it["corroboration_score"] = len(it["sources"])
-    items.sort(key=lambda x: x["corroboration_score"], reverse=True)
+        items.append(it)
+    items.sort(key=lambda x: (x["corroboration_score"], x["txn_id"]), reverse=True)
     return {
         "items": items,
         "summary": {
-            "total_unique_txn_ids": len(items),
+            "total_unique_transactions": len(items),
+            "distinct_identifiers": len(by_alias),
             "max_corroboration": items[0]["corroboration_score"] if items else 0,
             "single_source_count": sum(1 for it in items if it["corroboration_score"] == 1),
+            "available_sources": ["Transactions", "Chat", "Rewards", "Ledger"],
         },
     }
 
@@ -593,6 +717,17 @@ def detect_suspicious_signals(case_data: Dict[str, Any]) -> List[Dict[str, Any]]
 # Counterparty profile (per-contact dossier)
 # ---------------------------------------------------------------------------
 
+def _searchable(value: Any) -> str:
+    """Lower-cased text for substring matching. search_token is a joined string for
+    single-token transactions but a set/list when several tokens exist, so it can
+    never be assumed to be a str."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return " ".join(str(v) for v in value).lower()
+    return str(value).lower()
+
+
 def build_counterparty_profile(case_data: Dict[str, Any], identifier: str) -> Dict[str, Any]:
     """Return everything we know about a counterparty (phone, VPA, or name)."""
     out: Dict[str, Any] = {
@@ -628,7 +763,7 @@ def build_counterparty_profile(case_data: Dict[str, Any], identifier: str) -> Di
             (t.get("counterparty") and ident in str(t["counterparty"]).lower())
             or (t.get("counterparty_phone") and ident in str(t["counterparty_phone"]).lower())
             or (t.get("counterparty_vpa") and ident in str(t["counterparty_vpa"]).lower())
-            or (t.get("search_token") and ident in t["search_token"].lower())
+            or (ident in _searchable(t.get("search_token")))
         ):
             out["transactions"].append(t)
 

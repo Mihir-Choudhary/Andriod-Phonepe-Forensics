@@ -16,6 +16,30 @@ from __future__ import annotations
 from typing import Any, Dict
 
 PROVENANCE: Dict[str, Dict[str, Any]] = {
+    "_evidence_handling": {
+        "source": "phonepe_forensics/core.py — SQLiteReader / snapshot_database",
+        "fields": {
+            "read-only guarantee": "Evidence files are never written to. Every database and its "
+                                   "-wal/-shm/-journal sidecars are SHA-256 hashed BEFORE parsing. "
+                                   "A database with no WAL opens in place with immutable=1, which "
+                                   "cannot create or modify any file. One carrying a WAL is copied "
+                                   "with its sidecars to a scratch directory and recovered there, so "
+                                   "WAL-resident records are visible without touching the original. "
+                                   "The connection is set query_only once the schema is read.",
+            "WAL exclusion warning": "If the scratch copy cannot be staged (e.g. no disk), the "
+                                     "database is opened immutable in place and a warning is raised "
+                                     "on the dashboard, audit page and exported report stating that "
+                                     "-wal content is NOT included.",
+            "hash manifest": "Audit page + exports/chain_of_custody.json — per-file SHA-256 of "
+                             "every database opened, with the sidecar hashes.",
+            "timezone": "Every timestamp this tool emits is UTC. `iso` is ISO-8601 with an explicit "
+                        "+00:00 offset; `display` is suffixed 'UTC'. Values that would fall outside "
+                        "1973–2100 are rejected rather than rendered.",
+            "schema drift": "Requested columns are intersected with the acquisition's real schema. A "
+                            "renamed column narrows the projection and is reported on the Audit page "
+                            "as a schema gap, instead of failing the query and rendering an empty page.",
+        },
+    },
     "transactions": {
         "source": "phonepe_core.transaction_core  ⋈  transaction_text_attribute / "
                   "transaction_numeric_attribute (joined on transaction_id_type)",
@@ -24,7 +48,7 @@ PROVENANCE: Dict[str, Dict[str, Any]] = {
             "global_payment_id": "tstore_data JSON:globalPaymentId → transaction_core.payment_reference → .transaction_id",
             "type": "transaction_core.type",
             "state": "transaction_core.state",
-            "direction": "derived from .type (RECEIVED_PAYMENT→IN, SENT_PAYMENT/EXPENSE_SETTLEMENT/PIEDPIPER→OUT, P2P_ENRICHMENT→INTERNAL)",
+            "direction": "derived from .type (RECEIVED_PAYMENT→IN, SENT_PAYMENT/PIEDPIPER→OUT, P2P_ENRICHMENT→INTERNAL). EXPENSE_SETTLEMENT carries no payment leg, so its direction is resolved per row from tstore_data JSON:payerMemberId/payeeMemberId against the self member ids in chatTopicMeta.ownMemberId / ledger_my_split_topic.ownMemberId; self on both or neither side falls back to OUT.",
             "amount_inr": "tstore_data JSON:amount → paidFrom[0].amount → to[0].amount → instruments[0].amount  (paise ÷ 100)",
             "counterparty": "IN: tstore_data JSON:from.cbsName|accountHolderName|name · OUT: to[0].cbsName|accountHolderName|name · fallback transaction_core.contact_data (masked names fall back to phone)",
             "counterparty_resolved / _resolved_source / _phone_full": "MASKED→REAL recovery: when .name is source-masked, the full leg phone/VPA is matched EXACTLY (last-10 / VPA) against the user's own contacts (contactConnectionInfo ▸ phone_contacts ▸ vpa_contacts ▸ paymentProfileCache) to recover the real name; _resolved_source names the originating table + match key. Ambiguous last-10 phones (>1 distinct contact) are left unresolved.",
@@ -38,7 +62,12 @@ PROVENANCE: Dict[str, Dict[str, Any]] = {
             "response_code": "tstore_data JSON:responseCode → {leg}.transactionResponseCode",
             "created_at / updated_at": "transaction_core.timestamp_created / timestamp_updated (Unix ms)",
             "category_code": "transaction_text_attribute 'entity.category'",
-            "id_embedded_ts": "decoded from the transaction_id (T<YYMMDDhhmmss>…) itself",
+            "id_embedded_ts": "decoded from the transaction_id (T<YYMMDDhhmmss>…) itself. CAVEAT: the "
+                              "timezone the PhonePe server stamps into the ID is undocumented and has "
+                              "NOT been validated against a ground-truth transaction (IST is plausible). "
+                              "The wall-clock digits are reported as-is; the epoch conversion assumes UTC "
+                              "and is labelled 'UTC (unvalidated)'. Do not treat it as an independent "
+                              "corroboration of created_at without checking a known transaction first.",
         },
     },
     "identity": {
