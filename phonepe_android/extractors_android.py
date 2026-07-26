@@ -795,6 +795,7 @@ def extract_chat(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "created_at": normalize_timestamp(r.get("createdTime") or inner.get("createdAt")),
                     "updated_at": normalize_timestamp(r.get("lastUpdated") or inner.get("updatedAt")),
                     "visible": not bool(r.get("isDeleted")),
+                    "sender_member_id": src, "receiver_member_id": dst,
                     "sender_name": sender_name, "sender_phone_masked": member_masked.get(src),
                     "sender_role": None, "sender_is_self": sender_is_self,
                     "sender_name_resolved": s_name_res, "sender_resolved_source": s_src,
@@ -987,7 +988,8 @@ def _read_crashlytics(paths: AndroidCasePaths) -> Dict[str, Any]:
             if not os.path.exists(p):
                 continue
             try:
-                d = _json.load(open(p, encoding="utf-8"))
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    d = _json.load(fh)
             except Exception:
                 continue
             if isinstance(d, dict):
@@ -1606,7 +1608,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         man = os.path.join(d, "manifest.json")
         if os.path.exists(man):
             try:
-                m = _json.load(open(man, encoding="utf-8"))
+                with open(man, encoding="utf-8", errors="replace") as fh:
+                    m = _json.load(fh)
                 rec.update({"app_id": m.get("appId"), "app_unique_id": m.get("appUniqueId"),
                             "name": m.get("name"), "version": m.get("appVersion"),
                             "version_id": m.get("appVersionId")})
@@ -1615,7 +1618,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         cfg = os.path.join(d, "config.json")
         if os.path.exists(cfg):
             try:
-                c = _json.load(open(cfg, encoding="utf-8"))
+                with open(cfg, encoding="utf-8", errors="replace") as fh:
+                    c = _json.load(fh)
                 first = c[0] if isinstance(c, list) and c else (c if isinstance(c, dict) else {})
                 conf = first.get("config", first) if isinstance(first, dict) else {}
                 rec["merchant_name"] = conf.get("merchantName")
@@ -1626,7 +1630,8 @@ def extract_miniapps(paths: AndroidCasePaths) -> Dict[str, Any]:
         info = os.path.join(d, "nirvanaApplicationInfo.json")
         if os.path.exists(info):
             try:
-                i = _json.load(open(info, encoding="utf-8"))
+                with open(info, encoding="utf-8", errors="replace") as fh:
+                    i = _json.load(fh)
                 rec["category"] = i.get("category")
                 rec["installation_type"] = i.get("installationType")
                 rec["updated_at"] = normalize_timestamp(i.get("updatedAt"))
@@ -1879,6 +1884,18 @@ def parse_datastore_pb(data: bytes) -> Dict[str, Any]:
 
 # ---- all files/ (index + parse JSON + DataStore protobuf) ----
 
+# Files above this are indexed but not parsed into memory. A React Native bundle
+# or a cache blob can be tens of megabytes, and every parsed document is held for
+# the lifetime of the case.
+_MAX_PARSE_BYTES = 8 * 1024 * 1024
+
+
+def _is_crashlytics_native_doc(rel: str, ext: str) -> bool:
+    """Crashlytics writes extension-less JSON under .../native/ (device.json's
+    siblings). Match those, and nothing else without an extension."""
+    return ext == "(noext)" and "/native/" in rel.replace("\\", "/")
+
+
 def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
     out: Dict[str, Any] = {"files": [], "datastore": {}, "json_docs": {}, "summary": {}, "errors": []}
     import json as _json
@@ -1887,6 +1904,7 @@ def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
         return out
     by_ext: Counter = Counter()
     total = 0
+    skipped_large = 0
     for cur, _, fl in os.walk(paths.files_dir):
         for f in sorted(fl):
             p = os.path.join(cur, f)
@@ -1898,20 +1916,31 @@ def extract_files(paths: AndroidCasePaths) -> Dict[str, Any]:
             ext = os.path.splitext(f)[1].lower() or "(noext)"
             by_ext[ext] += 1; total += 1
             out["files"].append({"path": rel, "size": sz, "ext": ext})
+            if sz > _MAX_PARSE_BYTES:
+                skipped_large += 1
+                continue
             try:
                 if f.endswith(".preferences_pb"):
                     with open(p, "rb") as fh:
                         out["datastore"][rel] = parse_datastore_pb(fh.read())
-                elif f.endswith(".json") or f in ("user-data", "keys") or f.endswith(".bundle") is False and ext in ("(noext)",) and "/native/" in rel.replace("\\", "/"):
-                    txt = open(p, encoding="utf-8").read()
-                    s = txt.lstrip()
+                elif (f.endswith(".json") or f in ("user-data", "keys")
+                      or _is_crashlytics_native_doc(rel, ext)):
+                    with open(p, encoding="utf-8", errors="replace") as fh:
+                        s = fh.read().lstrip()
                     if s[:1] in "{[":
                         out["json_docs"][rel] = _json.loads(s)
             except Exception:
                 pass
     out["summary"] = {"file_count": total, "ext_breakdown": dict(by_ext),
                       "datastore_keys": sum(len(v) for v in out["datastore"].values()),
-                      "json_docs": len(out["json_docs"])}
+                      "json_docs": len(out["json_docs"]),
+                      "skipped_over_size_cap": skipped_large,
+                      "size_cap_bytes": _MAX_PARSE_BYTES}
+    if skipped_large:
+        out["errors"].append(
+            f"{skipped_large} file(s) larger than {_MAX_PARSE_BYTES // (1024 * 1024)} MB "
+            f"were indexed but not parsed."
+        )
     return out
 
 
@@ -1948,12 +1977,29 @@ _COVERED_TABLES = {
 }
 
 
-def extract_raw_tables(paths: AndroidCasePaths, row_cap: int = 100_000) -> Dict[str, Any]:
-    """Capture EVERY row of EVERY table in every readable SQLite DB (the long tail not owned by a
-    dedicated module). Guarantees no readable DB data is skipped. row_cap is a runaway backstop
-    far above any real table; if a table is ever capped it is logged in 'capped'."""
-    out: Dict[str, Any] = {"databases": {}, "capped": [], "summary": {}, "errors": []}
-    table_total = 0; row_total = 0
+def _decode_json_columns(rows: List[Dict[str, Any]]) -> None:
+    """Decode JSON-looking TEXT columns in place, for readability in the browser."""
+    for r in rows:
+        for k, v in list(r.items()):
+            if isinstance(v, str) and len(v) > 1 and v[0] in "{[" and v[-1] in "}]":
+                dec = decode_json_blob(v)
+                if isinstance(dec, (dict, list)):
+                    r[k] = dec
+
+
+def extract_raw_tables(paths: AndroidCasePaths) -> Dict[str, Any]:
+    """Inventory EVERY table in every readable SQLite DB, so nothing is silently skipped.
+
+    Only the shape is captured here — database, table, row count, columns. Row
+    bodies are read on demand by ``load_raw_table``, because materialising every
+    row of a 160-table acquisition held hundreds of megabytes in memory for the
+    lifetime of the case, most of it a second copy of rows the dedicated
+    extractors had already parsed.
+    """
+    out: Dict[str, Any] = {"databases": {}, "summary": {}, "errors": []}
+    table_total = 0
+    row_total = 0
+    duplicated = 0
     for db_path in paths.all_sqlites():
         name = os.path.basename(db_path)
         db_entry: Dict[str, Any] = {}
@@ -1964,24 +2010,124 @@ def extract_raw_tables(paths: AndroidCasePaths, row_cap: int = 100_000) -> Dict[
                         continue
                     n = db.count(t)
                     table_total += 1
-                    rows = db.query(f'SELECT * FROM "{t}" LIMIT {row_cap}')
-                    if isinstance(n, int) and n > row_cap:
-                        out["capped"].append({"db": name, "table": t, "rows": n, "captured": row_cap})
-                    # JSON-decode obvious JSON-string columns for usability
-                    for r in rows:
-                        for k, v in list(r.items()):
-                            if isinstance(v, str) and len(v) > 1 and v[0] in "{[" and v[-1] in "}]":
-                                dec = decode_json_blob(v)
-                                if isinstance(dec, (dict, list)):
-                                    r[k] = dec
-                    row_total += len(rows)
-                    db_entry[t] = {"row_count": n, "rows": rows}
+                    if isinstance(n, int) and n > 0:
+                        row_total += n
+                    covered = t in _COVERED_TABLES
+                    if covered:
+                        duplicated += 1
+                    db_entry[t] = {
+                        "row_count": n,
+                        "columns": db.columns(t),
+                        "path": db_path,
+                        # Tables a dedicated extractor already parses into a
+                        # curated view; still browsable, just flagged as such.
+                        "covered_by_module": covered,
+                    }
         except Exception as exc:
             db_entry["_error"] = str(exc)
+            out["errors"].append(f"{name}: {exc}")
         out["databases"][name] = db_entry
     out["summary"] = {"database_count": len(out["databases"]), "table_count": table_total,
-                      "row_total": row_total, "covered_by_dedicated_modules": len(_COVERED_TABLES),
-                      "capped_tables": len(out["capped"])}
+                      "row_total": row_total,
+                      "covered_by_dedicated_modules": duplicated,
+                      "lazy": True}
+    return out
+
+
+def load_raw_table(paths: AndroidCasePaths, db_name: str, table: str,
+                   offset: int = 0, limit: int = 500) -> Dict[str, Any]:
+    """Read one page of one raw table, on demand.
+
+    `db_name` and `table` are matched against the acquisition's real inventory
+    rather than interpolated blindly, so a crafted request cannot reach a file
+    outside the case or a name outside the schema.
+    """
+    limit = max(1, min(int(limit), 5000))
+    offset = max(0, int(offset))
+    db_path = next((p for p in paths.all_sqlites() if os.path.basename(p) == db_name), None)
+    if not db_path:
+        return {"error": f"unknown database: {db_name}", "rows": [], "columns": []}
+    with SQLiteReader(db_path) as db:
+        if table not in db.tables():
+            return {"error": f"unknown table: {table}", "rows": [], "columns": []}
+        total = db.count(table)
+        rows = db.query(f'SELECT * FROM "{table}" LIMIT ? OFFSET ?', (limit, offset))
+        if rows and "_error" in rows[0]:
+            return {"error": rows[0]["_error"], "rows": [], "columns": []}
+        _decode_json_columns(rows)
+        columns = db.columns(table)
+    return {"database": db_name, "table": table, "columns": columns, "rows": rows,
+            "row_count": total, "offset": offset, "limit": limit,
+            "has_more": offset + len(rows) < (total if isinstance(total, int) else 0)}
+
+
+# ---- deleted-record recovery ----
+
+# Tables worth carving, per database. Restricting the target list keeps the scan
+# proportionate and the results interpretable: these are the tables whose loss
+# changes an investigation's conclusions.
+_CARVE_TARGETS = {
+    "phonepe_core": [
+        "chatMessage", "transaction_core", "topicMember", "chatTopic",
+        "contactConnectionInfo", "phone_contacts", "vpa_contacts",
+        "phone_book_contacts", "ledger_expense", "ledger_expense_member",
+        "paymentProfileCache",
+    ],
+    "inference_data_provider": ["sms_buffer"],
+}
+
+
+def extract_deleted_records(paths: AndroidCasePaths) -> Dict[str, Any]:
+    """Recover rows deleted from the acquisition's databases.
+
+    Reported as evidence in its own right, separate from the live tables, and
+    never merged into them: a carved record is a reconstruction and has to stay
+    visibly distinguishable from a row the database still holds.
+    """
+    from phonepe_forensics.carver import SQLiteCarver
+
+    out: Dict[str, Any] = {"databases": {}, "records": [], "summary": {}, "errors": []}
+    if not paths.databases_dir:
+        out["errors"].append("databases/ not found")
+        return out
+
+    total = 0
+    by_table: Counter = Counter()
+    by_pool: Counter = Counter()
+    for db_path in paths.all_sqlites():
+        name = os.path.basename(db_path)
+        targets = _CARVE_TARGETS.get(name)
+        if targets is None:
+            continue
+        try:
+            carver = SQLiteCarver(db_path, db_path + "-wal", db_path + "-journal")
+            result = carver.carve(tables=targets)
+        except Exception as exc:
+            out["errors"].append(f"{name}: {exc}")
+            continue
+        for rec in result["records"]:
+            rec["database"] = name
+            by_table[rec.get("table") or "ambiguous"] += 1
+            by_pool[rec["pool"]] += 1
+        out["records"].extend(result["records"])
+        out["databases"][name] = {"summary": result["summary"], "notes": result["notes"]}
+        total += result["summary"]["recovered_count"]
+        for note in result["notes"]:
+            if "skipped" in note or "unreadable" in note:
+                out["errors"].append(f"{name}: {note}")
+
+    retained = {n: d["summary"].get("freed_content_retained")
+                for n, d in out["databases"].items()}
+    out["summary"] = {
+        "recovered_count": total,
+        "by_table": dict(by_table),
+        "by_pool": dict(by_pool),
+        "databases_carved": sorted(out["databases"]),
+        "freed_content_retained": retained,
+        "high_confidence": sum(1 for r in out["records"] if r["confidence"] == "high"),
+        "partial": sum(1 for r in out["records"] if r["partial"]),
+        "ambiguous": sum(1 for r in out["records"] if r["ambiguous"]),
+    }
     return out
 
 

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}SQL Console — PhonePe Android Forensics{% endblock %}
 {% block heading %}SQL Console{% endblock %}
-{% block subheading %}Run read-only SELECT / PRAGMA / EXPLAIN queries against any database in the case. Results capped at 1000 rows.{% endblock %}
+{% block subheading %}Run read-only SELECT / PRAGMA / EXPLAIN / WITH queries against the databases in this case. Results capped at {{ row_limit or 1000 }} rows.{% endblock %}
 
 {% block content %}
 
@@ -27,7 +27,13 @@
 
 {% if result is not none %}
 <div class="card" style="margin-top:18px">
-  <div class="card-title">Result ({{ result|length }} rows)</div>
+  <div class="card-title">
+    Result ({{ result|length }} rows{% if truncated %}, capped{% endif %})
+  </div>
+  {% if truncated %}
+  <p class="muted small">Showing the first {{ row_limit }} rows only — narrow the query
+     with your own WHERE or LIMIT to see the rest.</p>
+  {% endif %}
   {% if result %}
   <div class="tbl-wrap-scroll" style="max-height:65vh;overflow-y:auto">
   <table>

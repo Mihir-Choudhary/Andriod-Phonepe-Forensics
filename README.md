@@ -27,6 +27,29 @@ workspace (no operating-system picker) and parses every case as an Android acqui
 > examine. The tool is strictly read-only, but **never commit acquisitions, generated
 > output, or the case registry** — they are excluded by `.gitignore` for this reason.
 
+### How "read-only" is enforced
+
+The evidence directory is never written to, so it works on a read-only mount and stays
+byte-identical to the manifest taken at seizure:
+
+- Every database and its `-wal` / `-shm` / `-journal` sidecars are **SHA-256 hashed before
+  parsing**. The manifest appears on the Audit page and in `chain_of_custody.json`.
+- A database with **no WAL** is opened in place with `immutable=1`, which cannot create or
+  modify a file. (SQLite's ordinary `mode=ro` cannot do this: it still needs to create a
+  `-shm` next to the database, which fails on read-only media and mutates the folder when
+  it succeeds.)
+- A database **carrying a WAL** is copied with its sidecars to a scratch directory and
+  recovered there, so WAL-resident records are included without touching the original. The
+  connection is switched to `query_only` once the schema is read.
+- If a scratch copy cannot be staged, the database is opened `immutable` in place and a
+  warning is raised on the dashboard, the Audit page and the exported report saying that
+  `-wal` content is **not** included.
+
+**All timestamps are UTC**, stated explicitly: `iso` is ISO-8601 with a `+00:00` offset and
+`display` is suffixed `UTC`. The timestamp embedded in a PhonePe transaction ID is reported
+as raw wall-clock digits and labelled *unvalidated* — the issuing server's timezone is
+undocumented, so it is not treated as independent corroboration.
+
 ---
 
 ## Quick start
@@ -71,6 +94,62 @@ identity by **exact** cross-table lookup (connection_id / member_id / last-10 ph
 against the user's own contacts, and labels **each** recovered name by origin —
 *saved in PhonePe* vs *phonebook* — so you can see both. Matches are exact only and
 ambiguous phones (mapping to more than one person) are left unresolved, never guessed.
+
+The same rule governs the social graph: chat activity is attributed by **connection id**,
+never by display name, so two different contacts who share a name keep their own threads and
+their own message counts. A thread whose counterparty cannot be resolved to a connection is
+counted against the thread and marked as such, rather than being attached to a guessed name.
+
+Bank-SMS corroboration matches **exact paise**, within ±30 minutes, one-to-one, nearest in
+time first — so a transaction cannot be credited to an SMS belonging to a different payment
+of a similar amount, and the confirmed/uncorroborated counts do not depend on row order.
+
+## Deleted-record recovery
+
+Deleting a row does not erase it. SQLite unlinks the cell and returns its bytes to one of
+four pools, all of which usually still hold the original payload. The **Deleted Records**
+page walks all four and reconstructs what it finds:
+
+| Pool | What it is |
+|---|---|
+| `freelist` | whole pages released back to the database |
+| `freeblock` | a released cell inside a live page |
+| `page-slack` | a page's unallocated middle |
+| `pre-wal-image` / `wal-superseded` | a page version the WAL replaced — where a WAL-recorded deletion leaves the original row intact |
+| `journal` | a rollback journal pre-image |
+
+Recovered rows are matched against the real table schemas by column count and affinity,
+then **excluded if they are still present in the live table**, so only genuine deletions are
+reported. Each carries its pool, page, byte offset and source file.
+
+Two honesty constraints are built in. A record that fits more than one table is reported
+against **all** of them and flagged ambiguous rather than assigned to one. And because
+freeing a cell overwrites the record's first serial type, some rows are recovered with their
+leading field's boundary *inferred* — those are marked `partial`, and confidence is only
+`high` where the record's extent was confirmed structurally.
+
+An empty result is never presented as proof that nothing was deleted: freed space is reused
+over time, and a device with `secure_delete` on zeroes it immediately. Whether freed content
+survived is reported from what was actually recovered, not from `PRAGMA secure_delete` —
+that pragma is per-connection and would describe the examining machine, not the phone.
+
+## Layout
+
+```
+phonepe_forensics/
+  core/common.py    SQLiteReader, evidence snapshots, timestamps, hashing
+  core/ios.py       plist, binarycookies, NSKeyedArchiver, iOS containers
+  core/android.py   com.phonepe.app layout, JSON payloads, shared_prefs
+  carver.py         deleted-record recovery
+  correlator.py     timeline, social graph, corroboration, findings
+  hunt.py           PPQL
+phonepe_android/    Android extractors + case orchestration
+```
+
+`core` is split by platform so the shared engine stays maintainable in one place and this
+build can take upstream fixes without vendoring a private copy. `phonepe_forensics.core`
+re-exports everything, so `from phonepe_forensics.core import X` works regardless of which
+module `X` lives in.
 
 ## Limitations
 

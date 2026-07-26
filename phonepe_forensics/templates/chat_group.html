@@ -1,10 +1,8 @@
 {% extends "base.html" %}
 {% block title %}{{ group.name }} — Chat — PhonePe Android Forensics{% endblock %}
 {% block heading %}
-{% if group.v2_other_party_phone %}<img class="zoomable" data-caption="{{ group.v2_display_name or group.name }}" src="{{ url_for('page_avatar', phone=group.v2_other_party_phone) }}"
-     onerror="this.style.display='none'"
-     style="width:36px;height:36px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:10px;background:var(--bg-2)">{% endif %}Chat with {{ group.v2_display_name or group.name or '(unnamed conversation)' }}{% endblock %}
-{% block subheading %}Group {{ group.group_id }} · {{ members|length or group.member_count or '?' }} participants · {{ messages|length }} messages.{% if group.v2_other_party_phone %} · <span class="mono small">{{ group.v2_other_party_phone }}</span>{% endif %}{% endblock %}
+Chat with {{ group.name or '(unnamed conversation)' }}{% endblock %}
+{% block subheading %}Group {{ group.group_id }} · {{ members|length or group.member_count or '?' }} participants · {{ messages|length }} messages.{% endblock %}
 {% block topbar_actions %}
 <a href="{{ url_for('export_chat_group_csv', group_id=group.group_id) }}" class="btn">↧ Export this thread (CSV)</a>
 <a href="{{ url_for('page_chat') }}" class="btn">← All Groups</a>
@@ -82,10 +80,7 @@
     <div class="card-title">Counterparty Identity</div>
   </div>
   <div style="display:flex;align-items:center;gap:14px;margin:10px 0 4px">
-    {% set _cp = counterparty.phones[0] if counterparty.phones else (group.v2_other_party_phone or '') %}
-    <span class="dp dp-lg" data-initials="{{ (counterparty.display_name or '?')[:2]|upper }}">
-      {% if _cp %}<img class="zoomable" data-caption="{{ counterparty.display_name }}"
-        src="{{ url_for('page_avatar', phone=_cp) }}" onerror="this.remove()" loading="lazy">{% endif %}
+        <span class="dp dp-lg" data-initials="{{ (counterparty.display_name or '?')[:2]|upper }}">
     </span>
     <div>
       <div style="font-size:17px;font-weight:700">{{ counterparty.display_name }}</div>
@@ -128,9 +123,9 @@
     <tbody>
     {% for m in members %}
       <tr>
-        <td><b>{{ m.v2_display_name or m.display_name or '—' }}</b></td>
+        <td><b>{{ m.display_name or '—' }}</b></td>
         <td class="mono">
-          {% if m.v2_full_phone %}{{ m.v2_full_phone }}
+          {% if m.phone_full %}{{ m.phone_full }}
           {% elif m.masked_phone %}{{ m.masked_phone }} <span class="muted small" title="chat retained only the last 4 digits — full number not recoverable">masked</span>
           {% else %}—{% endif %}
         </td>
@@ -151,14 +146,7 @@
   <div class="chat-stream">
     {% for m in messages %}
       {% set is_self = (m.sender_is_self == true) or (m.direction == 'OUT') %}
-      {% set v2 = m.v2 or {} %}
       <div class="bubble-row {% if is_self %}me{% else %}them{% endif %}">
-        {% if not is_self and group.v2_other_party_phone %}
-          <img src="{{ url_for('page_avatar', phone=group.v2_other_party_phone) }}"
-               onerror="this.style.display='none'"
-               data-caption="{{ group.v2_display_name or group.name }}"
-               class="bubble-avatar zoomable">
-        {% endif %}
         <div class="bubble {% if is_self %}me{% else %}them{% endif %}">
           <div class="bubble-meta">
             {% if is_self %}
@@ -170,15 +158,14 @@
                 {% for x in rnm[1:] %}<span class="resolved-src" style="margin-left:6px">· {{ x.name }} ({{ x.source }})</span>{% endfor %}
               {% endif %}
             {% else %}
-              <b>{{ m.sender_name_resolved or m.v2_other_party_display or m.sender_name or m.other_party_name or group.v2_display_name or group.name or 'Unknown' }}</b>
+              <b>{{ m.sender_name_resolved or m.sender_name or m.other_party_name or group.name or 'Unknown' }}</b>
               {% if m.sender_name_resolved %}<span class="resolved-tag" title="Recovered by cross-table lookup; source value was masked">↩ recovered</span>{% endif %}
               {% set snm = m.sender_resolved_names or [] %}
               {% if m.sender_name_resolved and snm and snm[0].source %}<span class="resolved-src">· {{ snm[0].source }}</span>{% endif %}
               {% for x in snm[1:] %}<span class="resolved-src" style="margin-left:6px">· {{ x.name }} ({{ x.source }})</span>{% endfor %}
-              {% if m.sender_phone_full or m.v2_other_party_phone or m.sender_phone_masked %}<span class="mono small">{{ m.sender_phone_full or m.v2_other_party_phone or m.sender_phone_masked }}</span>{% endif %}
+              {% if m.sender_phone_full or m.sender_phone_masked %}<span class="mono small">{{ m.sender_phone_full or m.sender_phone_masked }}</span>{% endif %}
               <span class="muted small">→ You</span>
             {% endif %}
-            {% if v2.data_source == 'burble_only' %}<span class="tag med small" style="font-size:9px">Chat-only · pre-450d</span>{% endif %}
           </div>
           <div class="bubble-body">
             {% if m.type == 'PAYMENT_INFO_CARD' %}
@@ -186,57 +173,13 @@
                 <div class="pcard-amount">{{ m.amount_inr|inr }}</div>
                 <div class="pcard-state">
                   {% if m.state %}<span class="tag {{ m.state|lower }}">{{ m.state }}</span>{% endif %}
-                  {% if v2.classification %}<span class="tag {% if v2.classification == 'MERCHANT' %}accent{% elif v2.classification == 'PEER_TO_PEER' %}info{% elif v2.classification == 'MANDATE' %}med{% endif %}">{{ v2.classification }}</span>{% endif %}
-                  {% if v2.is_qr_scan %}<span class="tag med">QR</span>{% endif %}
-                  {% if v2.is_intent %}<span class="tag info">INTENT</span>{% endif %}
-                  {% if v2.is_refund %}<span class="tag med">REFUND</span>{% endif %}
-                  {% if v2.payment_initiation and v2.payment_initiation != 'DEFAULT' %}<span class="tag">{{ v2.payment_initiation }}</span>{% endif %}
                   <span class="dir-pill {% if is_self %}out{% else %}in{% endif %}">{% if is_self %}↑ Sent{% else %}↓ Received{% endif %}</span>
                 </div>
 
-                {# --- Routing rail: owner-side ↔ counterparty-side --- #}
-                {% if v2.owner_vpa or v2.counterparty_vpa %}
-                <div class="routing-rail">
-                  <div class="rail-leg {% if is_self %}sender{% else %}receiver{% endif %}">
-                    <div class="rail-label">Owner side {% if is_self %}(sent from){% else %}(received on){% endif %}</div>
-                    <div class="rail-vpa mono small">{{ v2.owner_vpa or '—' }}</div>
-                    <div class="rail-app">
-                      {% if v2.owner_app_icon %}<img src="{{ url_for('page_app_icon', icon_id=v2.owner_app_icon) }}" onerror="this.style.display='none'" class="rail-app-icon">{% endif %}
-                      <span>{{ v2.owner_app or 'Unknown' }}</span>
-                      {% if v2.owner_on_phonepe %}<span class="tag info small" style="font-size:9px">PhonePe-PSP</span>
-                      {% elif v2.owner_psp %}<span class="tag med small" style="font-size:9px">third-party PSP · @{{ v2.owner_psp }}</span>{% endif %}
-                    </div>
-                  </div>
-                  <div class="rail-arrow">{% if is_self %}→{% else %}←{% endif %}</div>
-                  <div class="rail-leg {% if is_self %}receiver{% else %}sender{% endif %}">
-                    <div class="rail-label">Counterparty {% if is_self %}(paid to){% else %}(sent from){% endif %}</div>
-                    <div class="rail-vpa mono small">{{ v2.counterparty_vpa or '—' }}</div>
-                    {% if v2.counterparty_phone or v2.counterparty_verified_name %}
-                    <div class="muted small" style="font-size:10px">
-                      {% if v2.counterparty_verified_name %}{{ v2.counterparty_verified_name }}{% endif %}
-                      {% if v2.counterparty_phone %}<span class="mono">{{ v2.counterparty_phone }}</span>{% endif %}
-                    </div>
-                    {% endif %}
-                    <div class="rail-app">
-                      {% if v2.counterparty_app and v2.counterparty_app != 'No VPA' %}
-                        {% if v2.counterparty_app_icon %}<img src="{{ url_for('page_app_icon', icon_id=v2.counterparty_app_icon) }}" onerror="this.style.display='none'" class="rail-app-icon">{% endif %}
-                        <span>{{ v2.counterparty_app }}</span>
-                      {% elif not is_self %}
-                        <span class="muted">PhonePe user · VPA not disclosed in feed</span>
-                      {% else %}
-                        <span class="muted">—</span>
-                      {% endif %}
-                    </div>
-                  </div>
-                </div>
-                {% endif %}
-
-                {% if v2.bank_name %}<div class="pcard-line">Bank: {{ v2.bank_name }}{% if v2.merchant_subtype %} · <span class="muted small">{{ v2.merchant_subtype }}</span>{% endif %}</div>{% endif %}
                 {% if m.transaction_id %}
                   <div class="pcard-line">Txn <a href="{{ url_for('page_transaction_detail', txn_id=m.transaction_id) }}" class="mono small">{{ m.transaction_id }}</a></div>
                 {% endif %}
                 {% if m.utr %}<div class="pcard-line">UTR <span class="mono small">{{ m.utr }}</span></div>{% endif %}
-                {% if v2.failure_reason %}<div class="pcard-line muted small">Failure: {{ v2.failure_reason }}</div>{% endif %}
                 {% if m.note %}<div class="pcard-line">Note: <i>{{ m.note }}</i></div>{% endif %}
               </div>
             {% elif m.type == 'TEXT_MESSAGE' %}

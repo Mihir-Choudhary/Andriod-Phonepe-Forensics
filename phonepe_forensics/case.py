@@ -15,12 +15,18 @@ Usage:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import time
 from typing import Any, Dict, List, Optional
 
-from .core import CasePaths, hash_file, normalize_timestamp
+from . import __version__ as TOOL_VERSION
+from .reports import TOOL_NAME
+
+from .core import (
+    evidence_manifest, evidence_warnings, hash_file, normalize_timestamp, schema_gaps,
+)
 from .correlator import (
     build_corroboration_index,
     build_counterparty_profile,
@@ -36,26 +42,52 @@ from .reports import export_all
 # ---------------------------------------------------------------------------
 
 class Case:
-    """In-memory container for one forensic acquisition."""
+    """In-memory container for one forensic acquisition.
 
-    # Base Case is platform-agnostic; concrete platforms (e.g. AndroidCase) define
-    # their own EXTRACTORS and override run_full_extraction.
+    Platform-agnostic: every derived view below reads only the normalized
+    contract in ``self.data``. A concrete platform supplies its own path
+    resolver and extractors — the base class no longer defaults to the iOS
+    layout, which made "generic" code quietly Apple-shaped.
+    """
+
+    #: Path resolver for this platform. Subclasses set it (AndroidCasePaths, …).
+    PATHS_CLASS: Any = None
+
+    #: (name, fn) pairs run in order by run_full_extraction.
     EXTRACTORS: List = []
 
     def __init__(self, root: str):
+        paths_class = self.PATHS_CLASS
+        if paths_class is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must set PATHS_CLASS (or override __init__) "
+                f"— Case itself is platform-neutral and has no layout of its own."
+            )
+        self._init_state(root, paths_class(os.path.abspath(root)))
+
+    def _init_state(self, root: str, paths: Any, **meta) -> None:
+        """Shared construction for every platform.
+
+        Subclasses call this rather than reimplementing __init__, so a new derived
+        view added here cannot go missing on one platform and AttributeError at
+        runtime on the other.
+        """
         self.root = os.path.abspath(root)
-        self.paths = CasePaths(self.root)
+        self.paths = paths
         self.data: Dict[str, Any] = {
             "_meta": {
                 "case_root": self.root,
                 "loaded_at": int(time.time() * 1000),
                 "containers": self.paths.summary(),
+                **meta,
             },
         }
         self._extracted = False
         self._timeline: Optional[List[Dict[str, Any]]] = None
         self._social_graph: Optional[Dict[str, Any]] = None
         self._findings: Optional[List[Dict[str, Any]]] = None
+        self._corroboration: Optional[Dict[str, Any]] = None
+        self._hunt_indexes: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
     # ---- validation ----
     # Concrete platforms (AndroidCase) override this with layout-specific checks.
@@ -82,6 +114,7 @@ class Case:
         # Findings + timeline + graph
         self._findings = detect_suspicious_signals(self.data)
         self.data["findings"] = self._findings
+        self.data["_meta"]["completed_at"] = int(time.time() * 1000)
         self._extracted = True
         return self.data
 
@@ -148,7 +181,61 @@ class Case:
         return self._findings
 
     def corroboration(self) -> Dict[str, Any]:
-        return build_corroboration_index(self.data)
+        # Rebuilding this walks every transaction, chat message and reward; it was
+        # recomputed on every page load that touched a transaction.
+        if self._corroboration is None:
+            self._corroboration = build_corroboration_index(self.data)
+        return self._corroboration
+
+    def hunt_indexes(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Flattened PPQL indexes. Built once — materialising them re-walks and
+        re-copies every record in the case, which was happening on each query."""
+        if self._hunt_indexes is None:
+            from .hunt import materialise_indexes
+            self._hunt_indexes = materialise_indexes(
+                self.data, self.timeline(), self.social_graph(), self.findings())
+        return self._hunt_indexes
+
+    # ---- extraction health ----
+    def extraction_errors(self) -> List[Dict[str, Any]]:
+        """Every module that failed or degraded, so the UI can say so.
+
+        A hard-coded SELECT against a renamed column yields an empty evidence page
+        that looks exactly like an acquisition with no such data. These have to be
+        visible or an analyst reports "no transactions" when the truth is
+        "transactions could not be read".
+        """
+        errors: List[Dict[str, Any]] = []
+        for name, payload in self.data.items():
+            if name.startswith("_") or not isinstance(payload, dict):
+                continue
+            if payload.get("error"):
+                errors.append({"module": name, "severity": "failed",
+                               "detail": str(payload["error"])})
+            for msg in payload.get("errors") or []:
+                errors.append({"module": name, "severity": "degraded", "detail": str(msg)})
+        for gap in schema_gaps(self.root):
+            errors.append({
+                "module": gap["database"], "severity": "schema",
+                "detail": f"{gap['table']}: columns absent from this acquisition — "
+                          f"{', '.join(gap['missing_columns'])}. Fields backed by them "
+                          f"are blank, not empty.",
+            })
+        inventory = self.data.get("database_inventory")
+        if isinstance(inventory, list):
+            for entry in inventory:
+                if isinstance(entry, dict) and entry.get("error"):
+                    errors.append({"module": "database_inventory", "severity": "failed",
+                                   "detail": f"{entry.get('rel_path', '?')}: {entry['error']}"})
+        return errors
+
+    def evidence_manifest(self) -> List[Dict[str, Any]]:
+        """Per-file SHA-256 of every database opened, hashed before parsing."""
+        return evidence_manifest(self.root)
+
+    def evidence_warnings(self) -> List[str]:
+        """Integrity caveats that must appear on any report built from this case."""
+        return evidence_warnings(self.root)
 
     def lookup_counterparty(self, identifier: str) -> Dict[str, Any]:
         return build_counterparty_profile(self.data, identifier)
@@ -160,12 +247,6 @@ class Case:
         chat_summary = self.data.get("chat", {}).get("summary", {})
         contacts_summary = self.data.get("contacts", {}).get("summary", {})
         analytics_summary = self.data.get("analytics", {}).get("summary", {})
-        v2 = self.data.get("_v2") or {}
-        v2_coverage = v2.get("coverage") or {}
-        # Prefer v2 unique count when available (combines Transactions + Chat),
-        # falling back to upstream extractor's count for older acquisitions
-        # where some payment tables are missing.
-        v2_total = v2_coverage.get("combined_unique")
         return {
             "case_root": self.root,
             "valid": self.paths.is_valid(),
@@ -177,7 +258,7 @@ class Case:
                 "location_hints": ident.get("location_hints", []),
             },
             "metrics": {
-                "transactions": v2_total if v2_total is not None else txn_summary.get("transaction_count", 0),
+                "transactions": txn_summary.get("transaction_count", 0),
                 "transactions_in": txn_summary.get("total_received_inr", 0),
                 "transactions_out": txn_summary.get("total_sent_inr", 0),
                 "groups": chat_summary.get("group_count", 0),
@@ -193,38 +274,42 @@ class Case:
             "yearly_volume": txn_summary.get("yearly_volume_inr", {}),
             "top_counterparties": txn_summary.get("top_counterparties", []),
             "findings_count": len(self.findings()),
-            # v2-derived tiles (None when enrichment unavailable)
-            "v2": {
-                "available": bool(v2),
-                "coverage": v2_coverage,
-                "retention_days": v2.get("retention_days"),
-                "owner_vpas": v2.get("owner_vpas", []),
-                "phonepe_psps": v2.get("phonepe_psps", []),
-                "by_app": v2.get("by_app", {}),
-                "by_initiation": v2.get("by_initiation", {}),
-                "qr_scan_count": v2.get("qr_scan_count", 0),
-                "intent_count": v2.get("intent_count", 0),
-                "failures_count": len(v2.get("failures", []) or []),
-                "failures_chat_only": sum(1 for f in (v2.get("failures") or []) if f.get("is_failed_chat_only")),
-                "refunds_count": len(v2.get("refunds", []) or []),
-                "mandates_count": v2.get("mandates_count", 0),
-                "tpap_map_size": v2.get("tpap_map_size", 0),
-                "source_db_hashes": v2.get("source_db_hashes", {}),
-                "subject_name": v2.get("owner_subject_name"),
-                "account_no": v2.get("owner_account_no"),
-                "bank_name": v2.get("owner_bank_name"),
-                "ifsc": v2.get("owner_ifsc"),
-            } if v2 else {"available": False},
+            "extraction_errors": self.extraction_errors(),
+            "evidence_warnings": evidence_warnings(),
         }
 
     # ---- export ----
-    def export_all(self, base_dir: str = "exports") -> Dict[str, Any]:
+    def custody_record(self, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Everything an exhibit needs to be attributable: who, what, when, which
+        tool, and the hashes of the source files as they were before parsing."""
+        meta = meta or {}
+        return {
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "case_name": meta.get("name"),
+            "case_id": meta.get("id"),
+            "investigator": meta.get("investigator"),
+            "notes": meta.get("notes"),
+            "evidence_root": self.root,
+            "platform": (self.data.get("_meta") or {}).get("platform", "android"),
+            "extraction_started_ms": (self.data.get("_meta") or {}).get("loaded_at"),
+            "extraction_completed_ms": (self.data.get("_meta") or {}).get("completed_at"),
+            "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "timestamps_are": "UTC",
+            "manifest": self.evidence_manifest(),
+            "evidence_warnings": self.evidence_warnings(),
+            "extraction_errors": self.extraction_errors(),
+        }
+
+    def export_all(self, base_dir: str = "exports",
+                   meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         out_dir = os.path.join(base_dir, _safe_name(os.path.basename(self.root) or "case"))
         return export_all(
             self.data, out_dir,
             timeline=self.timeline(),
             social_graph=self.social_graph(),
             case_root=self.root,
+            custody=self.custody_record(meta),
         )
 
 

@@ -64,6 +64,7 @@ Examples:
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -223,6 +224,47 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
             "system", "key", "type", "status", "last_attempt_iso", "last_completed_iso",
         ],
     },
+    # ---- Android-exclusive sources ----
+    "sms": {
+        "description": "Device SMS ingested by PhonePe for transaction inference "
+                       "(inference_data_provider.sms_buffer). Android-exclusive.",
+        "fields": ["id", "address", "body", "received_at_iso", "received_at_epoch_ms"],
+    },
+    "ledger_expenses": {
+        "description": "PhonePe 'Split' shared expenses, with payer and settlement linkage.",
+        "fields": [
+            "expense_id", "name", "type", "ledger_id", "state", "amount_inr",
+            "payer", "created_by", "settlement_txn_id", "created_at_iso",
+        ],
+    },
+    "ledger_balances": {
+        "description": "Per-member outstanding balances in each shared-expense ledger.",
+        "fields": ["name", "is_self", "ledger_id", "to_give_inr", "to_receive_inr"],
+    },
+    "miniapps": {
+        "description": "Installed Nirvana mini-apps (RN/PWA services) and their merchants.",
+        "fields": [
+            "dir_id", "app_id", "app_unique_id", "name", "version", "merchant_name",
+            "micro_app_type", "category", "installation_type", "updated_at_iso",
+        ],
+    },
+    "shared_prefs": {
+        "description": "Every shared_prefs/*.xml key/value, flattened to one row per key.",
+        "fields": ["file", "key", "value", "value_type"],
+    },
+    "deleted_records": {
+        "description": "Rows carved back out of freed space, WAL frames and rollback "
+                       "journals. These are reconstructions, not live rows.",
+        "fields": [
+            "database", "table", "confidence", "partial", "truncated", "ambiguous",
+            "pool", "page", "file_offset", "source_file", "recovered_text",
+        ],
+    },
+    "raw_tables": {
+        "description": "Inventory of every readable SQLite table (name, row count, columns). "
+                       "Row bodies are loaded on demand from the Raw Tables page.",
+        "fields": ["database", "table", "row_count", "columns", "captured"],
+    },
 }
 
 
@@ -273,6 +315,45 @@ def materialise_indexes(case_data: Dict[str, Any], timeline: List[Dict[str, Any]
     idx["webkit_domains"] = [_flatten_record(r) for r in case_data.get("webkit", {}).get("resource_load_stats", [])]
     idx["cookies"] = list(case_data.get("webkit", {}).get("cookies", []))
     idx["central_sync"] = [_flatten_record(s) for s in case_data.get("audit", {}).get("central_sync", [])]
+
+    # Android-exclusive sources. These are the differentiators of this build, so
+    # not indexing them meant the one evidence class you cannot get from an iOS
+    # acquisition was also the one class you could not hunt across.
+    idx["sms"] = [_flatten_record(m) for m in case_data.get("sms", {}).get("messages", [])]
+    idx["ledger_expenses"] = [_flatten_record(e) for e in case_data.get("ledger", {}).get("expenses", [])]
+    idx["ledger_balances"] = [_flatten_record(b) for b in case_data.get("ledger", {}).get("balances", [])]
+    idx["miniapps"] = [_flatten_record(a) for a in case_data.get("miniapps", {}).get("apps", [])]
+    idx["shared_prefs"] = [
+        {"file": fname, "key": key, "value": value,
+         "value_type": type(value).__name__}
+        for fname, prefs in (case_data.get("shared_prefs", {}).get("prefs", {}) or {}).items()
+        if isinstance(prefs, dict)
+        for key, value in prefs.items()
+    ]
+    idx["deleted_records"] = [
+        {"database": r.get("database"),
+         "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
+         "confidence": r.get("confidence"), "partial": r.get("partial"),
+         "truncated": r.get("truncated"), "ambiguous": r.get("ambiguous"),
+         "pool": r.get("pool"), "page": r.get("page"),
+         "file_offset": r.get("file_offset"), "source_file": r.get("source_file"),
+         # One searchable blob so `deleted_records | search "..."` reaches the
+         # recovered content regardless of which table the row came from.
+         "recovered_text": " ".join(str(v) for v in (r.get("row") or {}).values()
+                                    if v is not None),
+         **{k: v for k, v in (r.get("row") or {}).items() if v is not None}}
+        for r in (case_data.get("deleted_records", {}).get("records", []) or [])
+    ]
+    idx["raw_tables"] = [
+        {"database": db_name, "table": tname,
+         "row_count": tinfo.get("row_count"), "columns": tinfo.get("columns"),
+         "captured": tinfo.get("captured")}
+        for db_name, tables in (case_data.get("raw_tables", {}).get("databases", {}) or {}).items()
+        if isinstance(tables, dict)
+        for tname, tinfo in tables.items()
+        if isinstance(tinfo, dict) and not tname.startswith("_")
+    ]
+
     idx["timeline"] = list(timeline or [])
     idx["findings"] = list(findings or [])
     return idx
@@ -356,6 +437,15 @@ class _Parser:
         t = self.peek()
         return bool(t and t[0] == "ID" and t[1] in kws)
 
+    def _count(self) -> int:
+        """A row count for head/tail/top/rare. Rejects negatives outright: Python
+        slicing turns `head -2` into a silent truncation and `tail 0` into
+        `rows[-0:]`, which is every row — the opposite of what was asked."""
+        n = int(self.expect("NUM")[1])
+        if n < 0:
+            raise SyntaxError(f"row count must be zero or greater, got {n}")
+        return n
+
     def parse(self) -> Dict[str, Any]:
         q = {"source": self._parse_source(), "ops": []}
         while self.peek() and self.peek()[0] == "PIPE":
@@ -397,8 +487,7 @@ class _Parser:
                 direction = self.take()[1]
             return {"cmd": "sort", "field": field, "direction": direction}
         if cmd in ("head", "tail", "limit"):
-            n = int(self.expect("NUM")[1])
-            return {"cmd": cmd, "n": n}
+            return {"cmd": cmd, "n": self._count()}
         if cmd in ("table", "fields"):
             cols = [self.expect("ID")[1]]
             while self.peek() and self.peek()[0] == "PUNCT" and self.peek()[1] == ",":
@@ -406,11 +495,11 @@ class _Parser:
                 cols.append(self.expect("ID")[1])
             return {"cmd": "table", "fields": cols}
         if cmd == "top":
-            n = int(self.expect("NUM")[1])
+            n = self._count()
             field = self.expect("ID")[1]
             return {"cmd": "top", "n": n, "field": field}
         if cmd == "rare":
-            n = int(self.expect("NUM")[1])
+            n = self._count()
             field = self.expect("ID")[1]
             return {"cmd": "rare", "n": n, "field": field}
         if cmd == "stats":
@@ -531,8 +620,61 @@ def _coerce_pair(a: Any, b: Any) -> Tuple[Any, Any]:
     return a, b
 
 
-def _glob_to_regex(pat: str) -> re.Pattern:
-    return re.compile(fnmatch.translate(pat), re.IGNORECASE)
+def _sort_key(value: Any) -> Tuple[int, float, str]:
+    """Total order over a column that mixes types.
+
+    Evidence columns are not type-clean — the same field can be an int in one row,
+    a string in the next and null in a third — and Python refuses to compare those,
+    which turned `| sort <field>` into a runtime error on real data. Nulls sort
+    last, then numbers, then everything else as text.
+    """
+    if value is None:
+        return (2, 0.0, "")
+    if isinstance(value, bool):
+        return (1, 0.0, str(value))
+    if isinstance(value, (int, float)):
+        return (0, float(value), "")
+    return (1, 0.0, str(_group_key(value)))
+
+
+def _group_key(value: Any) -> Any:
+    """A hashable key for grouping/dedup. Several indexed fields hold decoded JSON
+    (dicts and lists), which cannot go into a set or a Counter."""
+    if isinstance(value, (dict, list, set, tuple, bytearray)):
+        try:
+            return json.dumps(value, default=str, sort_keys=True)
+        except Exception:
+            return str(value)
+    return value
+
+
+# Patterns are compiled once per query rather than once per record; a 100k-row
+# index previously recompiled the same regex 100k times.
+_MAX_PATTERN_LEN = 200
+_regex_cache: Dict[Tuple[str, str], Optional[re.Pattern]] = {}
+
+
+def _compiled(pattern: str, kind: str) -> Optional[re.Pattern]:
+    key = (kind, pattern)
+    if key in _regex_cache:
+        return _regex_cache[key]
+    compiled: Optional[re.Pattern]
+    if len(pattern) > _MAX_PATTERN_LEN:
+        compiled = None          # oversized patterns are the ReDoS vector
+    else:
+        try:
+            source = fnmatch.translate(pattern) if kind == "glob" else pattern
+            compiled = re.compile(source, re.IGNORECASE)
+        except re.error:
+            compiled = None
+    if len(_regex_cache) > 512:
+        _regex_cache.clear()
+    _regex_cache[key] = compiled
+    return compiled
+
+
+def _glob_to_regex(pat: str) -> Optional[re.Pattern]:
+    return _compiled(pat, "glob")
 
 
 def _evaluate_atom(atom: Dict[str, Any], rec: Dict[str, Any]) -> bool:
@@ -558,14 +700,13 @@ def _evaluate_atom(atom: Dict[str, Any], rec: Dict[str, Any]) -> bool:
     if op == "like":
         if actual is None:
             return False
-        return bool(_glob_to_regex(str(value)).fullmatch(str(actual)))
+        rx = _glob_to_regex(str(value))
+        return bool(rx.fullmatch(str(actual))) if rx else False
     if op == "matches":
         if actual is None:
             return False
-        try:
-            return bool(re.search(str(value), str(actual)))
-        except re.error:
-            return False
+        rx = _compiled(str(value), "regex")
+        return bool(rx.search(str(actual))) if rx else False
     if op == "contains":
         if actual is None:
             return False
@@ -605,7 +746,6 @@ def _full_text_match(rec: Dict[str, Any], term: str) -> bool:
             continue
         if isinstance(v, (dict, list)):
             try:
-                import json
                 if needle in json.dumps(v, default=str).lower():
                     return True
             except Exception:
@@ -639,7 +779,7 @@ def _agg_value(records: List[Dict[str, Any]], agg: Dict[str, Any]) -> Any:
     if fn == "max":
         return max(nums)
     if fn == "distinct_count":
-        return len(set(vals))
+        return len({_group_key(v) for v in vals})
     return None
 
 
@@ -692,30 +832,31 @@ def run_query(query: str, indexes: Dict[str, List[Dict[str, Any]]]) -> Dict[str,
                 rows = [r for r in rows if _full_text_match(r, op["term"])]
             elif cmd == "sort":
                 rev = op["direction"] == "desc"
-                def key(r, f=op["field"]):
-                    v = r.get(f)
-                    return (v is None, v if v is not None else "")
-                rows.sort(key=key, reverse=rev)
+                rows.sort(key=lambda r, f=op["field"]: _sort_key(r.get(f)), reverse=rev)
             elif cmd in ("head", "limit"):
                 rows = rows[: op["n"]]
             elif cmd == "tail":
-                rows = rows[-op["n"]:]
+                # rows[-0:] is the whole list, so zero has to be special-cased.
+                rows = rows[-op["n"]:] if op["n"] else []
             elif cmd == "table":
                 derived_columns = list(op["fields"])
                 rows = [{k: r.get(k) for k in derived_columns} for r in rows]
             elif cmd == "top":
-                cnt = Counter(r.get(op["field"]) for r in rows if r.get(op["field"]) is not None)
+                cnt = Counter(_group_key(r.get(op["field"])) for r in rows
+                              if r.get(op["field"]) is not None)
                 rows = [{op["field"]: k, "count": v} for k, v in cnt.most_common(op["n"])]
                 derived_columns = [op["field"], "count"]
             elif cmd == "rare":
-                cnt = Counter(r.get(op["field"]) for r in rows if r.get(op["field"]) is not None)
-                rows = [{op["field"]: k, "count": v} for k, v in cnt.most_common()[-op["n"]:]]
+                cnt = Counter(_group_key(r.get(op["field"])) for r in rows
+                              if r.get(op["field"]) is not None)
+                tail = cnt.most_common()[-op["n"]:] if op["n"] else []
+                rows = [{op["field"]: k, "count": v} for k, v in tail]
                 derived_columns = [op["field"], "count"]
             elif cmd == "stats":
                 if op["by"]:
                     groups: Dict[Any, List[Dict[str, Any]]] = {}
                     for r in rows:
-                        groups.setdefault(r.get(op["by"]), []).append(r)
+                        groups.setdefault(_group_key(r.get(op["by"])), []).append(r)
                     agg_label = _agg_label(op["agg"])
                     rows = sorted(
                         [{op["by"]: k, agg_label: _agg_value(v, op["agg"])} for k, v in groups.items()],
@@ -730,7 +871,7 @@ def run_query(query: str, indexes: Dict[str, List[Dict[str, Any]]]) -> Dict[str,
             elif cmd == "dedup":
                 seen = set(); out = []
                 for r in rows:
-                    v = r.get(op["field"])
+                    v = _group_key(r.get(op["field"]))
                     if v in seen:
                         continue
                     seen.add(v)

@@ -176,12 +176,6 @@
         <td><span class="tag {{ (t.state or 'unknown')|lower }}">{{ t.state }}</span></td>
         <td>
           <div style="display:flex;align-items:center;gap:8px">
-            {% if t.counterparty_phone %}
-              <img class="zoomable" data-caption="{{ t.counterparty or t.counterparty_phone }}"
-                   src="{{ url_for('page_avatar', phone=t.counterparty_phone) }}"
-                   onerror="this.style.display='none'"
-                   style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;background:var(--bg-2)">
-            {% endif %}
             <div>
               {% if t.counterparty_resolved %}
                 <div>
@@ -216,9 +210,6 @@
           {% set icon = t.receiver_app_icon if t.direction == 'OUT' else t.sender_app_icon %}
           {% if app and app != 'No VPA' %}
             <div style="margin-top:3px;display:flex;align-items:center;gap:4px">
-              {% if icon %}<img src="{{ url_for('page_app_icon', icon_id=icon) }}"
-                   onerror="this.style.display='none'"
-                   style="width:14px;height:14px;border-radius:2px;flex-shrink:0">{% endif %}
               <span style="font-size:11px;color:var(--text-2)">{{ app }}</span>
             </div>
           {% endif %}

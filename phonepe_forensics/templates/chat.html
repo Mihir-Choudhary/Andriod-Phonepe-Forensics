@@ -38,7 +38,7 @@
     <tbody>
       {% for g in chat.groups %}
       <tr>
-        <td><a href="{{ url_for('page_chat_group', group_id=g.group_id) }}">{{ g.v2_display_name or g.name or '—' }}</a></td>
+        <td><a href="{{ url_for('page_chat_group', group_id=g.group_id) }}">{{ g.name or '—' }}</a></td>
         <td>{{ g.type or g.subsystem or '—' }}</td>
         <td>{{ g.active|yes_no }}</td>
         <td class="mono right">{{ g.member_count or '' }}</td>
@@ -123,8 +123,8 @@
           {% else %}<span class="dir-pill unk">?</span>{% endif %}
         </td>
         <td>
-          {% set op_disp = m.other_party_resolved or m.v2_other_party_display or m.other_party_name %}
-          {% set op_ph = m.other_party_phone_full or m.v2_other_party_phone or m.other_party_phone %}
+          {% set op_disp = m.other_party_resolved or m.other_party_name %}
+          {% set op_ph = m.other_party_phone_full or m.other_party_phone %}
           {% if is_out %}
             <span class="muted small">You →</span> {{ party(op_disp or m.receiver_name, m.other_party_resolved, m.other_party_resolved_names, m.other_party_resolved_source, op_ph) }}
           {% elif is_in %}
