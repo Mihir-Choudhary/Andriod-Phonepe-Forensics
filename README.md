@@ -6,13 +6,6 @@ This tool was **inspired by, [Sujay Adkesar](https://github.com/sujayadkesar)'s
 [PhonePe-Forensics](https://github.com/sujayadkesar/PhonePe-Forensics)** project. Sujay's repository was
 used as the **reference** to code this Android tool and to **understand the PhonePe forensic architecture**
 
-The architectural decisions inherited from that work are the ones that made an Android port
-tractable at all — in particular the **normalized `case.data` contract**, which keeps every
-platform-specific parser on one side of a boundary and every consumer (timeline, social graph,
-findings, hunt, reports) on the other. Adding a second platform meant writing new extractors,
-not a second tool. The correlator, PPQL hunt console, provenance model and report layer are all
-Sujay's design, carried across.
-
 > 🔜 **Coming soon:** this Android tool will be **merged back into Sujay's repo** so there is a **single
 > tool that handles both iOS and Android** — instead of two separate tools. You'll pick the platform on
 > launch and the analyser loads the matching parser and layout.
