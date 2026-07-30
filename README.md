@@ -23,7 +23,7 @@ workspace (no operating-system picker) and parses every case as an Android acqui
 > ⚠️ **Handles real personal data.** A PhonePe acquisition contains a person's complete
 > financial, social and identity history. Use only on evidence you are authorised to
 > examine. The tool is strictly read-only, but **never commit acquisitions, generated
-> output, or the case registry** — they are excluded by `.gitignore` for this reason.
+> output, or the case registry**.
 
 ### How "read-only" is enforced
 
