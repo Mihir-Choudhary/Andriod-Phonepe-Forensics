@@ -8,6 +8,13 @@ used as the **reference** to code this Android tool and to **understand the Phon
 (the normalized data contract, correlator/timeline/social-graph engine, hunt console and report layer).
 Full credit and thanks to Sujay Adkesar for the original work that made this Android port possible.
 
+The architectural decisions inherited from that work are the ones that made an Android port
+tractable at all — in particular the **normalized `case.data` contract**, which keeps every
+platform-specific parser on one side of a boundary and every consumer (timeline, social graph,
+findings, hunt, reports) on the other. Adding a second platform meant writing new extractors,
+not a second tool. The correlator, PPQL hunt console, provenance model and report layer are all
+Sujay's design, carried across.
+
 > 🔜 **Coming soon:** this Android tool will be **merged back into Sujay's repo** so there is a **single
 > tool that handles both iOS and Android** — instead of two separate tools. You'll pick the platform on
 > launch and the analyser loads the matching parser and layout.
@@ -51,6 +58,91 @@ as raw wall-clock digits and labelled *unvalidated* — the issuing server's tim
 undocumented, so it is not treated as independent corroboration.
 
 ---
+
+## Screenshots
+
+> **Every screenshot below is a fabricated demo case, not evidence.** The subject is
+> `Test Subject`, the counterparties are `Demo Payee One`/`Demo Merchant Ltd`, and every
+> number is in the `9876500000` documentation range. No real acquisition was used to produce
+> any image here — the fixture is built from nothing by
+> [`notes/make_demo_acquisition.py`](notes/make_demo_acquisition.py), which fills PhonePe's
+> real table shapes with invented rows. Note the sidebar in each shot: the case is literally
+> named *SYNTHETIC DATA*.
+>
+> The fixture uses the **real schema on purpose**, so these pages are produced by the same
+> extractors, correlator and templates that parse evidence — a mock would show a screenshot
+> that proves nothing. Panels that are empty are empty because the fabricated case genuinely
+> has no such data.
+
+**Dashboard** — identity, money flow, top counterparties ranked by stable identifier (not by
+name), recent activity, and an honest banner naming every source that could not be read.
+
+![Forensic dashboard](docs/screenshots/01-dashboard.png)
+
+**Transaction ledger** — direction, counterparty, state and instrument per row, with
+`MERCHANT` / `PEER_TO_PEER` classification and `QR`/`INTENT` initiation tags read from the
+payload rather than inferred.
+
+![Transaction ledger](docs/screenshots/02-transactions.png)
+
+**Unified timeline** — every evidence database merged into one chronology: transactions, chat,
+ledger splits, SMS, push notifications and device-sync events, each labelled with its source.
+
+![Unified timeline](docs/screenshots/03-timeline.png)
+
+**Chat thread** — reconstructed conversation with payment cards inline. The participants table
+shows masked→real recovery working: `9876500001` recovered where the chat itself stored only
+`******0001`, with the recovery labelled as such rather than presented as if it were stored.
+
+![Chat thread](docs/screenshots/09-chat-thread.png)
+
+**Split / bill ledger** — who paid, who owes, and the settlement→transaction link. The
+subject's net position spells the direction out in words instead of leaving it to the sign.
+
+![Split ledger](docs/screenshots/05-ledger.png)
+
+**Social-financial graph** — one node per identifier, with transaction and chat activity joined
+onto it and each node's evidence sources listed.
+
+![Social graph](docs/screenshots/04-social-graph.png)
+
+**PPQL hunting** — an SPL-style query language over every index, with CSV export.
+
+![PPQL hunting](docs/screenshots/06-hunt.png)
+
+**Suspicious signals** — heuristic findings, each carrying its own supporting data. Note the
+two honest ones: a "no deleted records recovered" finding that states outright it is *not*
+evidence nothing was deleted, and an uncorroborated-payments finding that reports the ledger's
+retained date range so absence-by-retention is not mistaken for deletion.
+
+![Findings](docs/screenshots/10-findings.png)
+
+**Audit & lifecycle** — the SHA-256 manifest taken *before* parsing, how each database was
+opened (`immutable` in place vs recovered against a scratch copy), and every extraction
+degradation. The evidence path shown is the throwaway temp directory the fixture was built in.
+
+![Audit and hash manifest](docs/screenshots/08-audit.png)
+
+**Provenance** — the source database, table and column, or the JSON path inside a payload,
+behind every field the tool displays. This page contains no case data at all: it is the
+tool's own account of how it reads evidence.
+
+![Provenance](docs/screenshots/07-provenance.png)
+
+### Regenerating the screenshots
+
+```bash
+python notes/make_demo_acquisition.py /tmp/demo-case      # build the synthetic fixture
+cd /tmp/demo-case && python /path/to/run.py 127.0.0.1:8791  # serve from a scratch cwd,
+                                                            # so the case registry cannot
+                                                            # contain a real acquisition
+```
+
+Then capture the pages. Two rules, because a screenshot is published data: serve the demo from
+a directory that has never held a real case — the sidebar and page context inject the *active*
+case's name, subject and root into **every** page, so one stale active case leaks into shots
+that have nothing to do with it — and open each finished PNG and look at it, since an image
+cannot be grepped.
 
 ## Quick start
 
@@ -144,6 +236,11 @@ phonepe_forensics/
   correlator.py     timeline, social graph, corroboration, findings
   hunt.py           PPQL
 phonepe_android/    Android extractors + case orchestration
+notes/
+  smoke_test.py            headless end-to-end run of one acquisition
+  make_demo_acquisition.py builds the synthetic case behind the screenshots
+  demo_schema.sql          table shapes for that fixture (CREATE statements only)
+docs/screenshots/          README images — synthetic data only
 ```
 
 `core` is split by platform so the shared engine stays maintainable in one place and this
