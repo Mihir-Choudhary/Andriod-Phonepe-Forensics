@@ -50,20 +50,7 @@ undocumented, so it is not treated as independent corroboration.
 
 ---
 
-## Screenshots
-
-> **Every screenshot below is a fabricated demo case, not evidence.** The subject is
-> `Test Subject`, the counterparties are `Demo Payee One`/`Demo Merchant Ltd`, and every
-> number is in the `9876500000` documentation range. No real acquisition was used to produce
-> any image here — the fixture is built from nothing by
-> [`notes/make_demo_acquisition.py`](notes/make_demo_acquisition.py), which fills PhonePe's
-> real table shapes with invented rows. Note the sidebar in each shot: the case is literally
-> named *SYNTHETIC DATA*.
->
-> The fixture uses the **real schema on purpose**, so these pages are produced by the same
-> extractors, correlator and templates that parse evidence — a mock would show a screenshot
-> that proves nothing. Panels that are empty are empty because the fabricated case genuinely
-> has no such data.
+## View
 
 **Dashboard** — identity, money flow, top counterparties ranked by stable identifier (not by
 name), recent activity, and an honest banner naming every source that could not be read.
