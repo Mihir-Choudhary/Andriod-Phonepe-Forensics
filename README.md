@@ -1,12 +1,10 @@
 # PhonePe Android Forensics
 
-## 🙏 Credits & Acknowledgements
+## Credits & Acknowledgements
 
-This tool was **inspired by, and built on the foundation of, [Sujay Adkesar](https://github.com/sujayadkesar)'s
+This tool was **inspired by, [Sujay Adkesar](https://github.com/sujayadkesar)'s
 [PhonePe-Forensics](https://github.com/sujayadkesar/PhonePe-Forensics)** project. Sujay's repository was
 used as the **reference** to code this Android tool and to **understand the PhonePe forensic architecture**
-(the normalized data contract, correlator/timeline/social-graph engine, hunt console and report layer).
-Full credit and thanks to Sujay Adkesar for the original work that made this Android port possible.
 
 The architectural decisions inherited from that work are the ones that made an Android port
 tractable at all — in particular the **normalized `case.data` contract**, which keeps every
