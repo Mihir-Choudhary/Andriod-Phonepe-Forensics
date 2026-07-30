@@ -10,7 +10,8 @@
 
 <div class="metric-grid">
   <div class="metric"><div class="mlabel">Recovered</div><div class="mvalue">{{ deleted.summary.recovered_count or 0 }}</div></div>
-  <div class="metric"><div class="mlabel">High confidence</div><div class="mvalue">{{ deleted.summary.high_confidence or 0 }}</div></div>
+  <div class="metric"><div class="mlabel">Extent confirmed</div><div class="mvalue">{{ deleted.summary.high_confidence or 0 }}</div><div class="msub">start+end known structurally</div></div>
+  <div class="metric"><div class="mlabel">Values suspect</div><div class="mvalue">{{ deleted.summary.value_suspect or 0 }}</div><div class="msub">field outside its column's range</div></div>
   <div class="metric"><div class="mlabel">Partial</div><div class="mvalue">{{ deleted.summary.partial or 0 }}</div><div class="msub">leading field reconstructed</div></div>
   <div class="metric"><div class="mlabel">Ambiguous</div><div class="mvalue">{{ deleted.summary.ambiguous or 0 }}</div><div class="msub">fits &gt;1 table</div></div>
 </div>
@@ -80,7 +81,16 @@
           {% if r.ambiguous %}<br><span class="tag med">ambiguous</span>{% endif %}
         </td>
         <td>
-          <span class="tag {% if r.confidence == 'high' %}accent{% else %}med{% endif %}">{{ r.confidence }}</span>
+          <span class="tag {% if r.confidence == 'high' %}accent{% else %}med{% endif %}"
+                title="Confidence in the record's EXTENT — where it began and ended. Not a claim about the values.">extent: {{ r.confidence }}</span>
+          {% if r.value_confidence %}
+            <br><span class="tag small {% if r.value_confidence == 'low' %}med{% endif %}"
+                  title="Confidence that the decoded fields sit in the right columns.">values: {{ r.value_confidence }}</span>
+          {% endif %}
+          {% if r.implausible_columns %}
+            <br><span class="tag med" title="These columns hold a value outside the range the live table uses — the fields are probably shifted by one.">shifted?</span>
+            <span class="mono small">{{ r.implausible_columns|join(', ') }}</span>
+          {% endif %}
           {% if r.partial %}<br><span class="tag small">partial</span>{% endif %}
           {% if r.truncated %}<br><span class="tag small">truncated</span>{% endif %}
         </td>

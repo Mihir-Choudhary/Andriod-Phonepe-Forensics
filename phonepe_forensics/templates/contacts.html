@@ -1,14 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Contacts — PhonePe Android Forensics{% endblock %}
 {% block heading %}Contacts{% endblock %}
-{% block subheading %}{{ contacts.summary.cyclops_total }} PhonePe contacts · {{ contacts.summary.phonebook_total }} phonebook entries · {{ contacts.summary.external_image_count }} cached profile pictures.{% endblock %}
+{% block subheading %}{{ contacts.summary.cyclops_total }} distinct PhonePe contacts
+(from {{ contacts.summary.cyclops_source_rows or contacts.summary.cyclops_total }} source rows —
+one person can appear in phone_contacts, vpa_contacts and paymentProfileCache) ·
+{{ contacts.summary.phonebook_total }} phonebook entries.{% endblock %}
 
 {% block content %}
 
 <div class="metric-grid">
   <div class="metric"><div class="mlabel">PhonePe contacts</div><div class="mvalue">{{ contacts.summary.cyclops_total }}</div></div>
   <div class="metric"><div class="mlabel">Phonebook entries</div><div class="mvalue">{{ contacts.summary.phonebook_total }}</div></div>
-  <div class="metric"><div class="mlabel">On PhonePe</div><div class="mvalue pos">{{ contacts.summary.on_phonepe_count }}</div></div>
+  <div class="metric" title="{{ contacts.summary.on_phonepe_basis }}"><div class="mlabel">On PhonePe</div><div class="mvalue pos">{{ contacts.summary.on_phonepe_count }}</div><div class="msub">stated by a source row</div></div>
   <div class="metric"><div class="mlabel">Deleted contacts</div><div class="mvalue">{{ contacts.summary.deleted_contacts }}</div></div>
   <div class="metric"><div class="mlabel">Cached profile pics</div><div class="mvalue">{{ contacts.summary.external_image_count }}</div></div>
 </div>
@@ -112,6 +115,61 @@
 </div>
 {% endif %}
 
+{% if contacts.source_conflicts %}
+<div class="card" style="margin-top:18px">
+  <div class="card-title">Contradictions in the source data
+    <span class="badge-pill badge-warn">{{ contacts.source_conflicts|count }}</span>
+  </div>
+  <p class="muted small">
+    The acquisition stores many people twice — once as <span class="mono">9876543210</span> and
+    once as <span class="mono">+919876543210</span>, under one connection id — and for these
+    people the two rows <b>disagree</b>. Both rows are listed in the tables above exactly as
+    stored; neither is preferred here, because the evidence does not say which is current.
+    Counts treat “on PhonePe” as true if any row for that person states it.
+  </p>
+  <table>
+    <thead><tr><th>Field</th><th>Conflicting values</th><th>Phone</th></tr></thead>
+    <tbody>
+    {% for c in contacts.source_conflicts %}
+      <tr>
+        <td class="mono small">{{ c.field }}</td>
+        <td>{% for v in c.conflicting_values %}<span class="tag med">{{ v or '(empty)' }}</span> {% endfor %}</td>
+        <td class="mono pii">{{ c.phones|join(', ') or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if contacts.non_contacts %}
+<div class="card" style="margin-top:18px">
+  <div class="card-title">Non-Contacts ({{ contacts.non_contacts|count }})</div>
+  <p class="muted small">
+    From <span class="mono">phonepe_core.nonContact</span> — connections the subject interacted
+    with that are <b>not</b> saved contacts. <span class="mono">CONTACT_SEARCH</span> rows are
+    numbers looked up inside PhonePe; <span class="mono">GROUPS</span> rows are people met
+    through a group. A number here that appears in no contact table is an association the
+    address book does not show.
+  </p>
+  <table>
+    <thead><tr><th>Phone</th><th>Seen via</th><th>Known</th><th>Hidden</th><th>In phonebook</th><th>Connection id</th></tr></thead>
+    <tbody>
+    {% for c in contacts.non_contacts %}
+      <tr>
+        <td class="mono pii">{{ c.phone or '—' }}</td>
+        <td><span class="tag">{{ c.use_case }}</span></td>
+        <td>{{ c.known|yes_no }}</td>
+        <td>{{ c.hidden|yes_no }}</td>
+        <td>{{ c.is_phone_contact|yes_no }}</td>
+        <td class="mono small">{{ c.connect_id }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 <style>
 .contacts-table td { vertical-align:middle; }
 .dp {
@@ -157,5 +215,6 @@ a:hover .chat-link-ico { opacity:1; }
   wire('pbTable','pb-q','pb-only-txn','pbCount');
 })();
 </script>
+
 
 {% endblock %}

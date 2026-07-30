@@ -153,6 +153,9 @@ def export_deleted_records_csv(case_data: Dict[str, Any], out_dir: str) -> str:
     rows = [{
         "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
         "confidence": r.get("confidence"),
+        "extent_confidence": r.get("extent_confidence"),
+        "value_confidence": r.get("value_confidence"),
+        "implausible_columns": "; ".join(r.get("implausible_columns") or []),
         "partial": r.get("partial"),
         "truncated": r.get("truncated"),
         "ambiguous": r.get("ambiguous"),
@@ -165,9 +168,49 @@ def export_deleted_records_csv(case_data: Dict[str, Any], out_dir: str) -> str:
         "recovered_values": json.dumps(r.get("row", {}), default=str),
     } for r in records]
     path = os.path.join(out_dir, "recovered_deleted_records.csv")
-    _write_csv(path, ["table", "confidence", "partial", "truncated", "ambiguous", "pool",
+    _write_csv(path, ["table", "confidence", "extent_confidence", "value_confidence",
+                      "implausible_columns", "partial", "truncated", "ambiguous", "pool",
                       "database", "source_file", "page", "file_offset", "type_lost_for",
                       "recovered_values"], rows)
+    return path
+
+
+def export_notification_messages_csv(case_data: Dict[str, Any], out_dir: str) -> str:
+    """Delivered push/inbox notifications — the content the subject was shown.
+
+    Exported as its own exhibit because these reach years further back than the
+    local transaction ledger does, so they carry much of the early timeline.
+    """
+    rows = (case_data.get("notifications", {}) or {}).get("raw_messages", [])
+    path = os.path.join(out_dir, "notification_messages.csv")
+    _write_csv(path, ["created_at", "sent_at", "kind", "title", "subtitle", "body",
+                      "deeplink", "template", "topic_id", "message_id", "expires_at",
+                      "is_notification"], rows)
+    return path
+
+
+def export_consents_csv(case_data: Dict[str, Any], out_dir: str) -> str:
+    """Consent grants from both stores.
+
+    Its own exhibit because "what did the subject agree to share, and when" is a
+    question asked directly of an acquisition, and the answer spans two separate
+    databases — so each row names the store it came from.
+    """
+    rows = (case_data.get("audit", {}) or {}).get("consents", [])
+    path = os.path.join(out_dir, "consents.csv")
+    _write_csv(path, ["source", "destination", "accept_type", "state", "subject_id",
+                      "subject_ref", "definition", "sync_state", "consent_id",
+                      "end_time"], rows)
+    return path
+
+
+def export_identity_accounts_csv(case_data: Dict[str, Any], out_dir: str) -> str:
+    """The signed-in account record — the acquisition's most direct attribution of
+    the account to a phone number (accounts_db keeps it unmasked)."""
+    rows = (case_data.get("identity", {}) or {}).get("accounts", [])
+    path = os.path.join(out_dir, "identity_accounts.csv")
+    _write_csv(path, ["user_id", "display_name", "user_name", "phone",
+                      "phone_verified", "email", "email_verified", "source"], rows)
     return path
 
 
@@ -349,11 +392,45 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
     txns = case_data.get("transactions", {}).get("transactions", [])[:50]
     parts.append(_section("Recent Transactions (top 50)", _txn_table(txns)))
 
-    # Top counterparties
+    # Top counterparties, ranked by amount and keyed on a STABLE identifier.
+    #
+    # The exhibit is where the grouping rule matters most, and it was the last place
+    # still ranking by frequency of a display NAME — the very thing this tool refuses
+    # to treat as an identity elsewhere (two people can share a name, and one person's
+    # name is spelled several ways across the tables). Received and sent are reported
+    # separately, because a net figure hides which direction the money went.
+    for label, key in (("Received from", "top_counterparties_received"),
+                       ("Sent to", "top_counterparties_sent")):
+        entries = txn_summary.get(key) or []
+        if not entries:
+            continue
+        rows = [{
+            "name": e.get("name"),
+            "type": e.get("kind"),
+            "identifiers": "; ".join(e.get("identifiers") or []) or "—",
+            "grouped_by": e.get("grouped_by"),
+            "txn_count": e.get("count"),
+            "total_inr": _money(e.get("amount_inr")),
+        } for e in entries]
+        parts.append(_section(
+            f"Top Counterparties · {label} (by total amount)",
+            "<p class='muted'>Grouped by a stable identifier — PhonePe userId, then full "
+            "phone, then VPA — and never by display name. <b>grouped_by</b> states which "
+            "identifier keyed each row. Successful transactions only.</p>"
+            + _table(rows, ["name", "type", "identifiers", "grouped_by",
+                            "txn_count", "total_inr"])))
+
+    # Frequency ranking kept as a secondary view, explicitly labelled as name-keyed
+    # so it cannot be mistaken for the identifier-keyed tables above.
     top_cp = txn_summary.get("top_counterparties", [])
     if top_cp:
-        parts.append(_section("Top Counterparties",
-            _table([{"name": n, "txn_count": c} for n, c in top_cp], ["name", "txn_count"])))
+        parts.append(_section("Most Frequent Counterparty Names",
+            "<p class='muted'>Ranked by number of transactions and keyed on the display "
+            "name as stored, so rows here may merge two people who share a name or split "
+            "one person whose name is spelled differently across tables. Use the "
+            "amount-ranked tables above for attribution.</p>"
+            + _table([{"name": n, "txn_count": c} for n, c in top_cp],
+                     ["name", "txn_count"])))
 
     # Linked accounts
     pi = case_data.get("payment_infra", {})
@@ -389,7 +466,10 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
         dsum = deleted.get("summary", {})
         rows = [{
             "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
-            "confidence": r.get("confidence"),
+            "extent": r.get("extent_confidence") or r.get("confidence"),
+            "values": (r.get("value_confidence") or "")
+                      + (f" (check {', '.join(r['implausible_columns'])})"
+                         if r.get("implausible_columns") else ""),
             "pool": r.get("pool"),
             "provenance": f"{r.get('source_file')} page {r.get('page')} @ {r.get('file_offset')}",
             "recovered": "; ".join(f"{k}={v}" for k, v in (r.get("row") or {}).items()
@@ -400,13 +480,19 @@ def export_html_report(case_data: Dict[str, Any], out_dir: str, case_root: str =
             "<p class='muted'>Rows carved from freed pages, released cells, WAL frames and "
             "rollback journals — data the app deleted that the database had not yet "
             "overwritten. Each is a <b>reconstruction</b>, excluded from the live tables and "
-            "listed only where it is absent from them. <b>Confidence</b> is high where the "
-            "record's extent was confirmed structurally and medium where field boundaries "
-            "were inferred. An empty result is not proof nothing was deleted: freed space is "
-            "reused over time, and secure_delete zeroes it immediately.</p>"
+            "listed only where it is absent from them. Two separate judgements are reported: "
+            "<b>extent</b> is high where the record's start and end were confirmed "
+            "structurally and medium where the field boundaries were inferred, while "
+            "<b>values</b> says whether the decoded fields can be trusted to sit in the "
+            "right columns — <i>low</i> marks a row holding a value outside the range its "
+            "column uses in the live table, which means the fields are probably shifted. "
+            "A high extent is not a claim that the values are right. An empty result is not "
+            "proof nothing was deleted: freed space is reused over time, and secure_delete "
+            "zeroes it immediately.</p>"
             + (f"<p class='muted'>Showing the first 200 of {len(drecs)}; the full set is in "
                f"recovered_deleted_records.csv.</p>" if len(drecs) > 200 else "")
-            + _table(rows, ["table", "confidence", "pool", "provenance", "recovered"])))
+            + _table(rows, ["table", "extent", "values", "pool", "provenance",
+                            "recovered"])))
 
     # Findings
     findings = case_data.get("findings", [])
@@ -527,6 +613,12 @@ def export_all(case_data: Dict[str, Any], out_dir: str, timeline: List[Dict[str,
     out["files"].extend(export_payment_infra_csv(case_data, out_dir))
     if (case_data.get("deleted_records", {}) or {}).get("records"):
         out["files"].append(export_deleted_records_csv(case_data, out_dir))
+    if (case_data.get("notifications", {}) or {}).get("raw_messages"):
+        out["files"].append(export_notification_messages_csv(case_data, out_dir))
+    if (case_data.get("audit", {}) or {}).get("consents"):
+        out["files"].append(export_consents_csv(case_data, out_dir))
+    if (case_data.get("identity", {}) or {}).get("accounts"):
+        out["files"].append(export_identity_accounts_csv(case_data, out_dir))
     if timeline is not None:
         out["files"].append(export_timeline_csv(timeline, out_dir))
     if social_graph is not None:

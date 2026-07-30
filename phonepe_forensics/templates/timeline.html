@@ -1,7 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Timeline — PhonePe Android Forensics{% endblock %}
 {% block heading %}Unified Timeline{% endblock %}
-{% block subheading %}{{ events|length }} chronologically merged events from every evidence database.{% endblock %}
+{% block subheading %}
+{% if truncated %}
+  Showing the most recent {{ events|length }} of
+  {% if matched != total %}{{ matched }} matching ({{ total }} total){% else %}{{ total }}{% endif %}
+  chronologically merged events — raise the cap with <span class="mono">?limit=</span>.
+{% else %}
+  {{ events|length }} chronologically merged events from every evidence database{% if matched != total %},
+  filtered from {{ total }}{% endif %}.
+{% endif %}
+{% endblock %}
 {% block topbar_actions %}
 <a href="?limit=500" class="btn subtle">Top 500</a>
 <a href="?limit=2000" class="btn subtle">Top 2000</a>

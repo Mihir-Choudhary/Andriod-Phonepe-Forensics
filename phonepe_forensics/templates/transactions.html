@@ -191,13 +191,22 @@
               {% if t.counterparty_cbs_name and t.counterparty_cbs_name != t.counterparty and t.counterparty_cbs_name != t.counterparty_resolved %}
                 <div class="muted small">CBS: {{ t.counterparty_cbs_name }}</div>
               {% endif %}
-              {% if t.classification or t.data_source %}
+              {# A "Chat-only" tag keyed on `t.data_source == 'burble_only'` was here.
+                 Nothing in the codebase produces `data_source`, and by construction it
+                 cannot apply: this table lists `transaction_core` rows, so a payment
+                 known *only* from a chat card is not in it — those are reported by the
+                 `uncorroborated_transactions` finding instead. Removed because an absent
+                 tag reads as "no chat-only payments", which the page cannot know. #}
+              {# The guard must list every tag inside, not just classification: the QR and
+                 INTENT tags render for rows that carry no classification. A third tag
+                 keyed on `t.is_refund` was dropped — nothing sets it and no refund
+                 marker exists anywhere in this acquisition's transaction payloads, so
+                 it could only ever be absent, which reads as "no refunds". #}
+              {% if t.classification or t.is_qr_scan or t.is_intent %}
                 <div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">
                   {% if t.classification %}<span class="tag {% if t.classification == 'MERCHANT' %}accent{% elif t.classification == 'PEER_TO_PEER' %}info{% elif t.classification == 'MANDATE' %}med{% else %}{% endif %}" style="font-size:9px">{{ t.classification }}</span>{% endif %}
-                  {% if t.data_source == 'burble_only' %}<span class="tag med" style="font-size:9px">Chat-only</span>{% endif %}
                   {% if t.is_qr_scan %}<span class="tag med" style="font-size:9px">QR</span>{% endif %}
                   {% if t.is_intent %}<span class="tag info" style="font-size:9px">INTENT</span>{% endif %}
-                  {% if t.is_refund %}<span class="tag med" style="font-size:9px">REFUND</span>{% endif %}
                 </div>
               {% endif %}
             </div>
@@ -206,13 +215,14 @@
         <td class="mono small">
           {% if t.counterparty_phone %}{{ t.counterparty_phone }}<br>{% endif %}
           {% if t.counterparty_vpa %}{{ t.counterparty_vpa }}{% endif %}
-          {% set app = t.receiver_app if t.direction == 'OUT' else t.sender_app %}
-          {% set icon = t.receiver_app_icon if t.direction == 'OUT' else t.sender_app_icon %}
-          {% if app and app != 'No VPA' %}
-            <div style="margin-top:3px;display:flex;align-items:center;gap:4px">
-              <span style="font-size:11px;color:var(--text-2)">{{ app }}</span>
-            </div>
-          {% endif %}
+          {# A counterparty "payment app" line stood here, reading `receiver_app` /
+             `sender_app` (and matching `_icon` keys) that nothing in the codebase sets.
+             Deliberately removed rather than implemented: naming the app means mapping
+             the VPA handle to a PSP (@ybl, @okaxis, @paytm …), and such a table is both
+             incomplete and easy to get wrong — @ybl is PhonePe-via-Yes-Bank, @okaxis is
+             Google-Pay-via-Axis — so a wrong app name would be a fabricated claim about
+             which app the counterparty used. The VPA itself is displayed directly above,
+             which is the evidence; the inference is the examiner's to make. #}
         </td>
         <td class="mono small">{{ t.received_in_type or t.transfer_mode or '—' }}</td>
         <td class="mono small">{{ t.utr or '—' }}</td>

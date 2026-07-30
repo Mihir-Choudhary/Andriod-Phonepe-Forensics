@@ -118,6 +118,42 @@ def fmt_ts(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Transaction state vocabulary
+# ---------------------------------------------------------------------------
+#
+# Lives here, in the platform-neutral core, because BOTH the parser (deciding what
+# to sum into a module summary) and the correlator (deciding what to flag) need the
+# same answer. It previously existed only as inline literals repeated at five call
+# sites in the correlator, which produced two bugs: ``ERRORED`` — the state Android
+# actually writes for a failed payment — was missing from the failed set, so real
+# failed payments raised no finding; and the correlator's comparisons were
+# case-sensitive while the extractor's were not.
+#
+# Keeping it here also preserves the dependency direction the extractors follow
+# (parser -> core, never parser -> correlator).
+#
+# Anything in neither set is neither summed nor flagged, which is the safe default
+# for a state this tool has not seen — and is reported rather than ignored.
+
+SUCCESS_STATES = frozenset({"COMPLETED", "SUCCESS", "SETTLED", "SUCCEEDED"})
+
+#: States meaning the payment did not complete. ERRORED is Android's; the rest are
+#: kept so the shared engine stays usable for iOS acquisitions.
+FAILED_STATES = frozenset({
+    "ERRORED", "ERROR", "FAILED", "FAILURE", "REJECTED", "DECLINED",
+    "CANCELLED", "CANCELED", "TIMED_OUT", "EXPIRED",
+})
+
+#: In-flight rather than failed, but reported alongside: a payment still pending at
+#: acquisition time is as interesting as one that failed.
+PENDING_STATES = frozenset({"PENDING", "IN_PROGRESS", "INITIATED", "CREATED"})
+
+
+def normalise_state(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+# ---------------------------------------------------------------------------
 # Hashing
 # ---------------------------------------------------------------------------
 
@@ -406,7 +442,16 @@ class SQLiteReader:
         kept, missing = [], []
         for c in raw_cols:
             (kept if c.strip('"').lower() in available else missing).append(c)
-        if not missing or not kept:
+        if not kept and missing:
+            # Every requested column is gone. The query is left untouched so SQLite's
+            # own "no such column" surfaces as an extraction error, but the gap is
+            # still recorded: without this the Audit page showed no schema gap for
+            # the very worst case of drift, where a whole projection went missing.
+            self.missing_columns.setdefault(table, []).extend(
+                s.strip('"') for s in missing)
+            _record_schema_gap(self.path, table, (s.strip('"') for s in missing))
+            return sql, missing
+        if not missing:
             return sql, missing
         self.missing_columns.setdefault(table, []).extend(s.strip('"') for s in missing)
         _record_schema_gap(self.path, table, (s.strip('"') for s in missing))
@@ -524,10 +569,44 @@ def decode_txn_id(txn_id: Optional[str]) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def safe_int(v: Any, default: int = 0) -> int:
+    # bool is an int subclass, so a True in an amount or timestamp column would
+    # otherwise read as the value 1 — i.e. ₹0.01 for a paise column. A boolean is
+    # not a number here; treat it as absent.
+    if isinstance(v, bool):
+        return default
     try:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def tri_bool(v: Any) -> Optional[bool]:
+    """True / False / None — never inventing False out of an absent value.
+
+    `bool(row.get("someFlag"))` is the wrong coercion for evidence: a NULL column,
+    a JSON key the record does not carry, and a stored `0` all collapse to False,
+    which reports "this is not the case" where the evidence says nothing at all.
+    Keep the three states distinct here and let the presentation layer decide how
+    to show unknown (`yes_no` renders it "—").
+
+    Strings are handled because shared_prefs XML and some JSON payloads store
+    booleans as text, and every non-empty string is truthy — so "false" would
+    otherwise be True. An unrecognised string is unknown rather than a guess.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0"):
+            return False
+        return None
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return None
 
 
 def safe_float(v: Any, default: float = 0.0) -> float:

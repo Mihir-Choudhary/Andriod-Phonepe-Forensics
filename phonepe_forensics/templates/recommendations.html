@@ -5,10 +5,22 @@
 
 {% block content %}
 
+{% if recs.summary.source_absent %}
+<div class="card">
+  <div class="card-title">Source not present in this acquisition <span class="badge-pill badge-warn">absent</span></div>
+  <p class="muted small">
+    This build reads recommendations from <span class="mono">RecommendationsDatabase</span>,
+    which this extraction does not contain. That is an absent source, not an empty one — the
+    counts below are shown as “—” rather than 0 because nothing was measured.
+    {% for e in recs.errors %}<br><span class="mono">{{ e }}</span>{% endfor %}
+  </p>
+</div>
+{% endif %}
+
 <div class="metric-grid">
-  <div class="metric"><div class="mlabel">Products tracked</div><div class="mvalue">{{ recs.summary.product_count }}</div></div>
-  <div class="metric"><div class="mlabel">Recommendations</div><div class="mvalue">{{ recs.summary.recommendation_count }}</div></div>
-  <div class="metric"><div class="mlabel">Signals</div><div class="mvalue">{{ recs.summary.signal_count }}</div></div>
+  <div class="metric"><div class="mlabel">Products tracked</div><div class="mvalue">{{ recs.summary.product_count if recs.summary.product_count is not none else '—' }}</div></div>
+  <div class="metric"><div class="mlabel">Recommendations</div><div class="mvalue">{{ recs.summary.recommendation_count if recs.summary.recommendation_count is not none else '—' }}</div></div>
+  <div class="metric"><div class="mlabel">Signals</div><div class="mvalue">{{ recs.summary.signal_count if recs.summary.signal_count is not none else '—' }}</div></div>
 </div>
 
 {% if recs.products %}

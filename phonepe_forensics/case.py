@@ -275,7 +275,11 @@ class Case:
             "top_counterparties": txn_summary.get("top_counterparties", []),
             "findings_count": len(self.findings()),
             "extraction_errors": self.extraction_errors(),
-            "evidence_warnings": evidence_warnings(),
+            # Scoped to THIS case's root. The snapshot cache is process-wide, so the
+            # unscoped call put another open case's integrity warnings on this
+            # case's dashboard — and an integrity warning attributed to the wrong
+            # acquisition is worse than none.
+            "evidence_warnings": self.evidence_warnings(),
         }
 
     # ---- export ----

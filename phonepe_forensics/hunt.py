@@ -82,8 +82,11 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
             "amount_inr", "amount_paise", "category_code", "received_in_type",
             "counterparty", "counterparty_phone", "counterparty_vpa",
             "counterparty_user_id", "counterparty_user_type", "counterparty_cbs_name",
+            "classification", "counterparty_resolved", "counterparty_resolved_source",
+            "counterparty_phone_full",
             "self_account_holder", "self_account_masked", "self_vpa", "self_ifsc",
-            "instrument_id", "utr", "transfer_mode", "context_tag", "response_code",
+            "instrument_id", "utr", "transfer_mode", "initiation_mode",
+            "upi_initiation_mode", "is_qr_scan", "is_intent", "context_tag", "response_code",
             "merchant_id", "merchant_name", "biller_id", "biller_name",
             "recharge_number", "note", "group_id", "group_template", "search_token",
             "created_at_iso", "updated_at_iso", "dismissed", "is_internal",
@@ -103,6 +106,14 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
             "raw_number", "normalized", "country_code", "region", "is_valid",
             "deleted", "full_name", "contact_id", "has_image", "image_size",
             "creation_time_iso",
+        ],
+    },
+    "non_contacts": {
+        "description": "phonepe_core.nonContact — connections interacted with that are NOT "
+                       "saved contacts, including numbers searched for inside PhonePe.",
+        "fields": [
+            "connect_id", "use_case", "phone", "phone_last10", "known", "hidden",
+            "is_phone_contact", "country_code", "region", "source",
         ],
     },
     "chat_messages": {
@@ -151,6 +162,25 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
             "topic_id", "subsystem", "storage_type", "subscription_status",
             "status", "raw_message_count", "single_use",
             "created_at_iso", "updated_at_iso", "last_sync_iso",
+        ],
+    },
+    "notification_messages": {
+        "description": "Delivered push/inbox messages decoded from "
+                       "BullhornDatabase.messageDataStore — the notifications the "
+                       "user was actually shown, plus sync instructions.",
+        "fields": [
+            "message_id", "topic_id", "kind", "title", "subtitle", "body",
+            "deeplink", "template", "is_notification", "sync_key",
+            "created_at_iso", "sent_at_iso", "expires_at_iso",
+        ],
+    },
+    "consents": {
+        "description": "Consent grants from BOTH stores (the standalone `consent` database "
+                       "and phonepe_core.consent) — what the subject agreed to share, with "
+                       "the store each record came from.",
+        "fields": [
+            "consent_id", "state", "accept_type", "destination", "subject_id",
+            "subject_ref", "definition", "sync_state", "end_time_iso", "source",
         ],
     },
     "kn_events": {
@@ -256,8 +286,10 @@ INDEX_DEFS: Dict[str, Dict[str, Any]] = {
         "description": "Rows carved back out of freed space, WAL frames and rollback "
                        "journals. These are reconstructions, not live rows.",
         "fields": [
-            "database", "table", "confidence", "partial", "truncated", "ambiguous",
-            "pool", "page", "file_offset", "source_file", "recovered_text",
+            "database", "table", "confidence", "extent_confidence",
+            "value_confidence", "implausible_columns", "partial", "truncated",
+            "ambiguous", "pool", "page", "file_offset", "source_file",
+            "recovered_text",
         ],
     },
     "raw_tables": {
@@ -298,12 +330,19 @@ def materialise_indexes(case_data: Dict[str, Any], timeline: List[Dict[str, Any]
     idx["transactions"] = [_flatten_record(t) for t in case_data.get("transactions", {}).get("transactions", [])]
     idx["contacts"] = [_flatten_record(c) for c in case_data.get("contacts", {}).get("cyclops_contacts", [])]
     idx["phonebook"] = [_flatten_record(c) for c in case_data.get("contacts", {}).get("phonebook_contacts", [])]
+    idx["non_contacts"] = [_flatten_record(c) for c in case_data.get("contacts", {}).get("non_contacts", [])]
     idx["chat_messages"] = [_flatten_record(m) for m in case_data.get("chat", {}).get("messages", [])]
     idx["chat_groups"] = [_flatten_record(g) for g in case_data.get("chat", {}).get("groups", [])]
     idx["chat_members"] = [_flatten_record(m) for m in case_data.get("chat", {}).get("members", [])]
     idx["shared_bank_disclosures"] = list(case_data.get("chat", {}).get("shared_contacts", []))
     idx["rewards"] = [_flatten_record(r) for r in case_data.get("financial", {}).get("rewards", [])]
     idx["notifications"] = [_flatten_record(t) for t in case_data.get("notifications", {}).get("topics", [])]
+    # Decoded payloads are dropped from the index: the searchable content is
+    # already flattened into title/subtitle/body/deeplink, and carrying the nested
+    # payload would put a second copy of every notification into the index.
+    idx["notification_messages"] = [
+        _flatten_record({k: v for k, v in m.items() if k != "payload"})
+        for m in case_data.get("notifications", {}).get("raw_messages", [])]
     idx["kn_events"] = [_flatten_record(e) for e in case_data.get("analytics", {}).get("kn_events", [])]
     idx["supported_banks"] = list(case_data.get("payment_infra", {}).get("supported_banks", []))
     idx["linked_cards"] = [_flatten_record(c) for c in case_data.get("payment_infra", {}).get("linked_cards", [])]
@@ -315,6 +354,7 @@ def materialise_indexes(case_data: Dict[str, Any], timeline: List[Dict[str, Any]
     idx["webkit_domains"] = [_flatten_record(r) for r in case_data.get("webkit", {}).get("resource_load_stats", [])]
     idx["cookies"] = list(case_data.get("webkit", {}).get("cookies", []))
     idx["central_sync"] = [_flatten_record(s) for s in case_data.get("audit", {}).get("central_sync", [])]
+    idx["consents"] = [_flatten_record(c) for c in case_data.get("audit", {}).get("consents", [])]
 
     # Android-exclusive sources. These are the differentiators of this build, so
     # not indexing them meant the one evidence class you cannot get from an iOS
@@ -333,7 +373,11 @@ def materialise_indexes(case_data: Dict[str, Any], timeline: List[Dict[str, Any]
     idx["deleted_records"] = [
         {"database": r.get("database"),
          "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
-         "confidence": r.get("confidence"), "partial": r.get("partial"),
+         "confidence": r.get("confidence"),
+         "extent_confidence": r.get("extent_confidence"),
+         "value_confidence": r.get("value_confidence"),
+         "implausible_columns": "; ".join(r.get("implausible_columns") or []),
+         "partial": r.get("partial"),
          "truncated": r.get("truncated"), "ambiguous": r.get("ambiguous"),
          "pool": r.get("pool"), "page": r.get("page"),
          "file_offset": r.get("file_offset"), "source_file": r.get("source_file"),
@@ -620,16 +664,24 @@ def _coerce_pair(a: Any, b: Any) -> Tuple[Any, Any]:
     return a, b
 
 
-def _sort_key(value: Any) -> Tuple[int, float, str]:
+def _sort_key(value: Any, descending: bool = False) -> Tuple[int, float, str]:
     """Total order over a column that mixes types.
 
     Evidence columns are not type-clean — the same field can be an int in one row,
     a string in the next and null in a third — and Python refuses to compare those,
-    which turned `| sort <field>` into a runtime error on real data. Nulls sort
-    last, then numbers, then everything else as text.
+    which turned `| sort <field>` into a runtime error on real data. Numbers first,
+    then everything else as text, and nulls always last.
+
+    `descending` exists because the caller reverses the whole sort: a fixed
+    "nulls rank highest" key puts them last ascending and *first* descending, so
+    `sort amount_inr desc | head 5` returned five rows with no amount — the rows
+    that legitimately have none (a P2P_ENRICHMENT metadata sibling carries no
+    amount) crowded out every real payment. Ranking nulls lowest when the sort is
+    about to be reversed keeps them last either way.
     """
+    null_rank = -1 if descending else 2
     if value is None:
-        return (2, 0.0, "")
+        return (null_rank, 0.0, "")
     if isinstance(value, bool):
         return (1, 0.0, str(value))
     if isinstance(value, (int, float)):
@@ -832,7 +884,8 @@ def run_query(query: str, indexes: Dict[str, List[Dict[str, Any]]]) -> Dict[str,
                 rows = [r for r in rows if _full_text_match(r, op["term"])]
             elif cmd == "sort":
                 rev = op["direction"] == "desc"
-                rows.sort(key=lambda r, f=op["field"]: _sort_key(r.get(f)), reverse=rev)
+                rows.sort(key=lambda r, f=op["field"]: _sort_key(r.get(f), rev),
+                          reverse=rev)
             elif cmd in ("head", "limit"):
                 rows = rows[: op["n"]]
             elif cmd == "tail":
