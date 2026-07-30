@@ -76,29 +76,34 @@
   <div class="metric"><div class="mlabel">Consents</div><div class="mvalue">{{ audit.summary.consent_count }}</div></div>
 </div>
 
-{% if audit.consent_user %}
-<div class="card" style="margin-top:18px">
-  <div class="card-title">Consent Subject</div>
-  <div class="kv">
-    <b>User ID</b><span class="mono">{{ audit.consent_user.user_id }}</span>
-    <b>Phone</b><span class="mono">{{ audit.consent_user.phone }}</span>
-    <b>Device fingerprint</b><span class="mono">{{ audit.consent_user.device_fingerprint }}</span>
-  </div>
-</div>
-{% endif %}
+{# A "Consent Subject" card (user id / phone / device fingerprint) stood here reading
+   `audit.consent_user`, which no extractor sets and which has no Android source: the
+   consent database's only subject field is `subjectRefId`, already shown as
+   "Subject ref" in the table below and exported in consents.csv. Removed rather than
+   left as a panel that could never render — see STATE.md pass 4. #}
 
 {% if audit.consents %}
 <div class="card" style="margin-top:18px">
-  <div class="card-title">Consent Acceptances</div>
+  <div class="card-title">Consent Acceptances
+    <a class="btn subtle" style="float:right" href="{{ url_for('export_consents_csv_route') }}">Export CSV</a>
+  </div>
+  <p class="muted small">
+    Merged from two separate stores — the standalone <span class="mono">consent</span> database
+    and <span class="mono">phonepe_core.consent</span>. The <b>Source</b> column names which
+    store each record came from.
+  </p>
   <table>
-    <thead><tr><th>State</th><th>Destination</th><th>Subject ID</th><th>End time</th></tr></thead>
+    <thead><tr><th>State</th><th>Accepted</th><th>Data type</th><th>Use case</th><th>Definition</th><th>End time</th><th>Source</th></tr></thead>
     <tbody>
     {% for c in audit.consents %}
       <tr>
         <td><span class="tag">{{ c.state }}</span></td>
+        <td>{% if c.accept_type %}<span class="tag {% if c.accept_type == 'ACCEPT' %}accent{% endif %}">{{ c.accept_type }}</span>{% else %}—{% endif %}</td>
         <td>{{ c.destination }}</td>
         <td class="mono small">{{ c.subject_id }}</td>
+        <td class="small">{{ c.definition or '—' }}</td>
         <td class="mono small">{{ c.end_time|ts }}</td>
+        <td class="mono small">{{ c.source or '—' }}</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -106,38 +111,29 @@
 </div>
 {% endif %}
 
-{% if audit.consent_definitions %}
-<div class="card" style="margin-top:18px">
-  <div class="card-title">Consent Definitions</div>
-  <table>
-    <thead><tr><th>Definition</th><th>Use case</th><th>Data source</th><th>Mapping ID</th></tr></thead>
-    <tbody>
-    {% for d in audit.consent_definitions %}
-      <tr>
-        <td>{{ d.definition }}</td>
-        <td>{{ d.use_case }}</td>
-        <td>{{ d.data_source }}</td>
-        <td class="mono small">{{ d.mapping_id }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</div>
-{% endif %}
+{# A "Consent Definitions" table stood here reading `audit.consent_definitions`, which
+   nothing sets and which has no separate source: the consent database holds exactly one
+   table (`consent`), and each row's `consentDefinition` is already carried as
+   `definition` on the consent records above. Removed as a panel that could never
+   render — see STATE.md pass 4. #}
 
 {% if audit.cassini_models %}
 <div class="card" style="margin-top:18px">
   <div class="card-title">On-device ML Models (Cassini)</div>
   <table>
-    <thead><tr><th>Name</th><th>ID</th><th>Local state</th><th>Server state</th><th>Checksum</th><th>Updated</th></tr></thead>
+    {# "Checksum" was a column with no source: `model_data` has no checksum field.
+       Replaced with version and on-device directory, which it does have. #}
+    <thead><tr><th>Name</th><th>ID</th><th>Version</th><th>Local state</th><th>Server state</th>
+               <th>On-device path</th><th>Updated</th></tr></thead>
     <tbody>
     {% for m in audit.cassini_models %}
       <tr>
         <td>{{ m.name }}</td>
         <td class="mono small">{{ m.id }}</td>
+        <td class="mono small">{{ m.version or '—' }}</td>
         <td><span class="tag">{{ m.local_state }}</span></td>
         <td>{{ m.server_state }}</td>
-        <td class="mono small">{{ m.checksum }}</td>
+        <td class="mono small">{{ m.directory_uri or '—' }}</td>
         <td class="mono small">{{ m.updated_at|ts }}</td>
       </tr>
     {% endfor %}

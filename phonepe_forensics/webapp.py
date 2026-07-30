@@ -22,6 +22,8 @@ import sys
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
+from jinja2 import Undefined
+
 from flask import (
     Flask, Response, abort, jsonify, redirect, render_template, request,
     send_file, session, url_for, flash,
@@ -139,6 +141,26 @@ def _filter_ts(value: Any) -> str:
 
 @app.template_filter("yes_no")
 def _filter_yes_no(value: Any) -> str:
+    # Absent is not "No". A missing column or JSON key rendered as "No" states a
+    # negative fact the evidence does not hold — the same class of error as the
+    # hardcoded "on PhonePe: Yes" tile. Undefined arrives here whenever a template
+    # reads a key the extractor never set, so it must be caught alongside None.
+    if value is None or isinstance(value, Undefined):
+        return "—"
+    # Sources are not uniformly typed: shared_prefs XML and some JSON payloads
+    # store booleans as the strings "true"/"false"/"0", and every non-empty string
+    # is truthy, so "false" would read as "Yes".
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1"):
+            return "Yes"
+        if v in ("false", "no", "0"):
+            return "No"
+        # Empty is unknown, not false — same rule as core.tri_bool, so a value
+        # rendered here and a value stored in case.data cannot disagree.
+        if not v:
+            return "—"
+        return value
     return "Yes" if value else "No"
 
 
@@ -512,6 +534,9 @@ def export_deleted_csv():
         row = {
             "table": r.get("table") or "/".join(r.get("candidate_tables") or []),
             "confidence": r.get("confidence"),
+            "extent_confidence": r.get("extent_confidence"),
+            "value_confidence": r.get("value_confidence"),
+            "implausible_columns": "; ".join(r.get("implausible_columns") or []),
             "partial": r.get("partial"),
             "truncated": r.get("truncated"),
             "ambiguous": r.get("ambiguous"),
@@ -526,7 +551,8 @@ def export_deleted_csv():
         # tables with different shapes without inventing a common schema.
         row["recovered_values"] = json.dumps(r.get("row", {}), default=str)
         rows.append(row)
-    cols = ["table", "confidence", "partial", "truncated", "ambiguous", "pool",
+    cols = ["table", "confidence", "extent_confidence", "value_confidence",
+            "implausible_columns", "partial", "truncated", "ambiguous", "pool",
             "database", "source_file", "page", "file_offset", "type_lost_for",
             "recovered_values"]
     return _csv_response(rows, cols, "recovered_deleted_records.csv")
@@ -697,7 +723,8 @@ def export_transactions_csv():
         "counterparty_resolved_source", "counterparty_phone_full",
         "counterparty_phone", "counterparty_vpa",
         "counterparty_cbs_name", "self_account_holder", "self_account_masked",
-        "self_vpa", "self_ifsc", "utr", "transfer_mode", "category_code",
+        "self_vpa", "self_ifsc", "utr", "transfer_mode", "initiation_mode",
+        "upi_initiation_mode", "is_qr_scan", "is_intent", "category_code",
         "received_in_type", "merchant_name", "biller_name", "recharge_number",
         "note", "search_token",
     ]
@@ -898,9 +925,28 @@ def page_notifications():
     topics = notifs.get("topics", [])
     if q or sub:
         topics = _filter_table(topics, q=q, filters={"subsystem": sub})
+    # Delivered notification bodies (messageDataStore). Only the ones the user was
+    # actually shown are tabled; sync instructions are counted but not listed.
+    messages = [m for m in notifs.get("raw_messages", []) if m.get("is_notification")]
+    if q:
+        messages = _filter_table(messages, q=q)
+    messages.sort(key=lambda m: (m.get("created_at") or {}).get("epoch_ms") or 0,
+                  reverse=True)
     return render_template("notifications.html",
-                           notifications={**notifs, "topics_view": topics},
+                           notifications={**notifs, "topics_view": topics,
+                                          "messages_view": messages[:3000]},
                            q=q, sub=sub, total_topics=len(notifs.get("topics", [])))
+
+
+@app.route("/notifications/messages.csv")
+def export_notification_messages_csv():
+    case = _active()
+    rows = [m for m in case.data.get("notifications", {}).get("raw_messages", [])
+            if m.get("is_notification") or not request.args.get("shown_only")]
+    rows = _filter_table(rows, q=request.args.get("q", ""))
+    cols = ["created_at", "sent_at", "kind", "title", "subtitle", "body", "deeplink",
+            "template", "topic_id", "message_id", "expires_at"]
+    return _csv_response(rows, cols, "notification_messages.csv")
 
 
 @app.route("/notifications/export.csv")
@@ -1067,15 +1113,34 @@ def page_audit():
                            case_root=case.root)
 
 
+@app.route("/audit/consents.csv")
+def export_consents_csv_route():
+    case = _active()
+    rows = _filter_table(case.data.get("audit", {}).get("consents", []),
+                         q=request.args.get("q", ""))
+    cols = ["source", "destination", "accept_type", "state", "subject_id",
+            "subject_ref", "definition", "sync_state", "consent_id", "end_time"]
+    return _csv_response(rows, cols, "consents.csv")
+
+
 @app.route("/timeline")
 def page_timeline():
     case = _active()
-    limit = _int_arg("limit", 1500, minimum=1)
+    limit = _int_arg("limit", 5000, minimum=1)
     q = request.args.get("q", "")
     src = request.args.get("source", "")
-    all_events = case.timeline(limit=limit)
-    events = _filter_table(all_events, q=q, filters={"source": src}) if (q or src) else all_events
-    return render_template("timeline.html", events=events, q=q, src=src, total=len(all_events))
+    # The true total comes from the uncapped timeline, never from the capped slice.
+    # Reading `total` off the already-limited list reported the cap as the total, so
+    # the page claimed to show everything while silently dropping the oldest events
+    # — which is what happened as soon as decoded notifications pushed the event
+    # count past the default limit.
+    full = case.timeline(limit=999_999)
+    total = len(full)
+    events = _filter_table(full, q=q, filters={"source": src}) if (q or src) else full
+    matched = len(events)
+    return render_template("timeline.html", events=events[:limit], q=q, src=src,
+                           total=total, matched=matched, limit=limit,
+                           truncated=matched > limit)
 
 
 @app.route("/timeline/export.csv")

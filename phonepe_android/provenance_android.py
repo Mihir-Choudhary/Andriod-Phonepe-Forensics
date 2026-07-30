@@ -48,7 +48,7 @@ PROVENANCE: Dict[str, Dict[str, Any]] = {
             "global_payment_id": "tstore_data JSON:globalPaymentId → transaction_core.payment_reference → .transaction_id",
             "type": "transaction_core.type",
             "state": "transaction_core.state",
-            "direction": "derived from .type (RECEIVED_PAYMENT→IN, SENT_PAYMENT/PIEDPIPER→OUT, P2P_ENRICHMENT→INTERNAL). EXPENSE_SETTLEMENT carries no payment leg, so its direction is resolved per row from tstore_data JSON:payerMemberId/payeeMemberId against the self member ids in chatTopicMeta.ownMemberId / ledger_my_split_topic.ownMemberId; self on both or neither side falls back to OUT.",
+            "direction": "RECEIVED_PAYMENT→IN, SENT_PAYMENT→OUT, P2P_ENRICHMENT→INTERNAL are taken from .type. Every OTHER type — PIEDPIPER_PAYMENT included — is resolved per row from the payload instead: tstore_data JSON:actor (RECEIVER→IN, SENDER→OUT), then the presence of paymentPayerParty (→IN) or paymentReceiver (→OUT). Typing PIEDPIPER_PAYMENT as OUT was wrong on half of them, checked against the app's own transaction_aggregate_entity ledger. EXPENSE_SETTLEMENT carries no payment leg, so its direction comes from tstore_data JSON:payerMemberId/payeeMemberId against the self member ids in chatTopicMeta.ownMemberId / ledger_my_split_topic.ownMemberId; self on both or neither side falls back to OUT.",
             "amount_inr": "tstore_data JSON:amount → paidFrom[0].amount → to[0].amount → instruments[0].amount  (paise ÷ 100)",
             "counterparty": "IN: tstore_data JSON:from.cbsName|accountHolderName|name · OUT: to[0].cbsName|accountHolderName|name · fallback transaction_core.contact_data (masked names fall back to phone)",
             "counterparty_resolved / _resolved_source / _phone_full": "MASKED→REAL recovery: when .name is source-masked, the full leg phone/VPA is matched EXACTLY (last-10 / VPA) against the user's own contacts (contactConnectionInfo ▸ phone_contacts ▸ vpa_contacts ▸ paymentProfileCache) to recover the real name; _resolved_source names the originating table + match key. Ambiguous last-10 phones (>1 distinct contact) are left unresolved.",
@@ -132,12 +132,74 @@ PROVENANCE: Dict[str, Dict[str, Any]] = {
             "chat link": "ledger_entity.topic_id (the split group is also a chat topic)",
         },
     },
+    "identity_account_record": {
+        "source": "accounts_db.account  (Android account-manager store — previously "
+                  "read by no extractor at all)",
+        "fields": {
+            "user_id": "accounts_db.account.user_id — the PhonePe account id that also appears "
+                       "as Bullhorn topic suffixes (CONSUMER_<user_id>@…) and as "
+                       "MaximusDatabase.product.entity_id. Reported as "
+                       "device_identifiers.phonepe_account_user_id, kept SEPARATE from the "
+                       "Crashlytics hashed telemetry userId.",
+            "phone": "accounts_db.account.user_phone_number — UNMASKED, unlike the sibling "
+                     "user_name column which is source-masked (******0961)",
+            "email / verified flags": "accounts_db.account.{user_email, email_verified, "
+                                      "phone_number_verified}",
+            "registered_name": "accounts_db.account.user_display_name → .user_name, but only "
+                               "when not source-masked; otherwise from phonepe_core "
+                               "accounts.account_holder_name / users.verified_name",
+        },
+    },
+    "consent": {
+        "source": "consent.consent (standalone database)  +  phonepe_core.consent",
+        "fields": {
+            "note": "Two separate stores. The standalone `consent` database was previously "
+                    "unread; each record now carries a `source` naming which store it came "
+                    "from, so a consent record is attributable.",
+            "data type / use case / accept type / state": "consent.{dataType, useCaseId, "
+                                                          "acceptType, consentState}",
+            "definition / sync state": "consent.{consentDefinition, consentSyncState}",
+            "subject_ref": "consent.subjectRefId, with the source's own 'NA' placeholder "
+                           "reported as absent rather than as a value",
+        },
+    },
+    "recommendations": {
+        "source": "MaximusDatabase (preferred) → RecommendationsDatabase (older name): "
+                  "product / recommendation_item / signal",
+        "fields": {
+            "note": "PhonePe renamed this store. Only the old name was tried, so an "
+                    "acquisition carrying all of the data reported the source as absent. "
+                    "Both names are tried and summary.database records which was used.",
+            "products / recommendations": "product.{product_id, product_name, "
+                                          "product_namespace}; recommendation_item.{item_id, "
+                                          "product_id, rank, item_expiry}",
+            "signals": "signal.{signal_type, signal_timestamp (Unix ms), is_synced, item_id} "
+                       "— IMPRESSION/CLICK events, which reach the unified timeline",
+        },
+    },
     "notifications": {
-        "source": "BullhornDatabase.topic (+ message / messageDataStore)",
+        "source": "BullhornDatabase.topic  ⋈  messageDataStore (delivered payloads) "
+                  "+ message (operation log)",
+        "blob": "messageDataStore.data is JSON whose .message.payload is base64-encoded "
+                "JSON — the notification template the user was shown.",
         "fields": {
             "subsystem / storage_type / subscription_status": "BullhornDatabase.topic.{subSystemType, messageStorageType, topicSubscriptionStatus}",
             "created/updated/expiry": "topic.{topicCreatedTimeStamp, topicUpdateTimeStamp, messageExpiry} (Unix ms)",
-            "raw_message_count": "COUNT(*) of BullhornDatabase.message by topicId_M",
+            "raw_message_count": "COUNT(*) of BullhornDatabase.message by topicId_M — the "
+                                 "operation log, which on real devices is near-empty and is "
+                                 "NOT a count of what was delivered",
+            "stored_message_count": "COUNT of messageDataStore rows whose decoded .message.topicId is this topic",
+            "title / subtitle / deeplink / template": "messageDataStore.data JSON:message.payload "
+                                                      "(base64→JSON) :data.placements[].template."
+                                                      "{templateParams.value.{title,subTitle}, "
+                                                      "templateId, nav.params.{deepLink*, "
+                                                      "redirection_data.data[key=url].value}}",
+            "kind": "derived: <system>/<operation> for sync instructions "
+                    "(e.g. CATALOGUE/SYNC), payload .type where present, else NOTIFICATION "
+                    "when a title/body is present",
+            "created_at / sent_at / expires_at": "messageDataStore payload envelope "
+                                                 ".message.created / .updated, and payload "
+                                                 ".sentAt / .expiresAt (Unix ms)",
         },
     },
     "sms": {

@@ -123,10 +123,19 @@ Chat with {{ group.name or '(unnamed conversation)' }}{% endblock %}
     <tbody>
     {% for m in members %}
       <tr>
-        <td><b>{{ m.display_name or '—' }}</b></td>
+        <td>
+          <b>{{ m.name_resolved or m.display_name or '—' }}</b>
+          {% if m.name_resolved %}
+            <div class="muted small" title="Chat stored a masked name; this was recovered by exact connection-id match against the subject's own contacts.">
+              recovered from {{ m.name_resolved_source }} · chat stored
+              <span class="mono">{{ m.display_name or 'no name' }}</span>
+            </div>
+          {% endif %}
+        </td>
         <td class="mono">
           {% if m.phone_full %}{{ m.phone_full }}
-          {% elif m.masked_phone %}{{ m.masked_phone }} <span class="muted small" title="chat retained only the last 4 digits — full number not recoverable">masked</span>
+            <div class="muted small" title="Recovered by connection id from the contact tables; chat itself retained only the last 4 digits.">recovered · chat had {{ m.masked_phone }}</div>
+          {% elif m.masked_phone %}{{ m.masked_phone }} <span class="muted small" title="Chat retained only the last digits, and no contact row matches this connection id, so the full number is not recoverable from this acquisition.">masked</span>
           {% else %}—{% endif %}
         </td>
         <td><span class="tag {{ (m.role or '')|lower }}">{{ m.role }}</span></td>

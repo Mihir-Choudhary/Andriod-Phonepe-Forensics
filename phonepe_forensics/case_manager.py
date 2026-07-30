@@ -76,13 +76,18 @@ class CaseManager:
     def _remember(self, case_id: str, case: Case) -> None:
         self._cache[case_id] = case
         self._cache.move_to_end(case_id)
+        # Evict least-recently-used, skipping the two cases that must stay: the one
+        # being viewed and the one just loaded. Scanning past a protected entry
+        # matters — abandoning eviction on the first one (which is what a `break`
+        # here did) left the cache unbounded whenever the LRU-oldest case was the
+        # active one, so a session that opened six cases kept all six parsed
+        # acquisitions resident.
+        protected = {self.active_id, case_id}
         while len(self._cache) > self.MAX_CACHED_CASES:
-            evicted_id, evicted_case = self._cache.popitem(last=False)
-            if evicted_id in (self.active_id, case_id):
-                # Never evict the case being viewed or the one just loaded.
-                self._cache[evicted_id] = evicted_case
-                self._cache.move_to_end(evicted_id, last=False)
-                break
+            victim = next((cid for cid in self._cache if cid not in protected), None)
+            if victim is None:
+                break            # everything left is protected; nothing to drop
+            del self._cache[victim]
 
     # ---- registry queries ----
     def list_cases(self) -> List[Dict[str, Any]]:

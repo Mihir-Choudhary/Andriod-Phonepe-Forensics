@@ -697,6 +697,7 @@ class SQLiteCarver:
             by_ncols.setdefault(spec["ncols"], []).append(name)
 
         live = {name: self._live_fingerprints(name) for name in targets}
+        enum_domains = {name: self._live_enum_domains(name) for name in targets}
         recovered: List[Dict[str, Any]] = []
         seen_fp: set = set()
         pools: Dict[str, int] = {}
@@ -766,6 +767,21 @@ class SQLiteCarver:
                 seen_fp.add(fingerprint)
                 primary = fits[0]
                 cols = targets[primary]["columns"]
+                implausible = self._implausible_columns(
+                    rec["values"], cols, enum_domains.get(primary) or {})
+                # Two independent claims, reported separately:
+                #   extent  — do we know where this record began and ended?
+                #   values  — do the decoded fields sit in the right columns?
+                # An anchored partial record scores high on the first and only
+                # "inferred" on the second, and a value outside its column's
+                # observed domain drops the second to "low" regardless.
+                extent_conf = "high" if (not lost or rec.get("anchored")) else "medium"
+                if implausible:
+                    value_conf = "low"
+                elif lost:
+                    value_conf = "inferred"
+                else:
+                    value_conf = "high"
                 recovered.append({
                     "candidate_tables": fits,
                     "table": primary if len(fits) == 1 else None,
@@ -778,11 +794,17 @@ class SQLiteCarver:
                     "lost_leading_columns": cols[:lost] if lost else [],
                     "overflow": bool(rec.get("overflow")),
                     "fields_decoded": reliable if reliable is not None else len(cols),
-                    # "high" means the record's extent was confirmed structurally:
+                    # "high" means the record's EXTENT was confirmed structurally:
                     # its header was intact, or its end lined up exactly with the
                     # next freed cell. "medium" means the field boundaries were
-                    # inferred and could be off.
-                    "confidence": "high" if (not lost or rec.get("anchored")) else "medium",
+                    # inferred and could be off. It says nothing about whether the
+                    # values landed in the right columns — read `value_confidence`
+                    # for that, and never present `confidence: high` alone as
+                    # "these values are reliable".
+                    "confidence": extent_conf,
+                    "extent_confidence": extent_conf,
+                    "value_confidence": value_conf,
+                    "implausible_columns": implausible,
                     "pool": region.pool,
                     "page": region.page_no,
                     "file_offset": region.file_base + off,
@@ -816,11 +838,75 @@ class SQLiteCarver:
                 "truncated_count": sum(1 for r in recovered if r["truncated"]),
                 "partial_count": sum(1 for r in recovered if r["partial"]),
                 "ambiguous_count": sum(1 for r in recovered if r["ambiguous"]),
+                # Extent-confident but with a field outside its column's observed
+                # domain: the row is really there, its columns are probably shifted.
+                "value_suspect_count": sum(1 for r in recovered
+                                           if r["value_confidence"] == "low"),
+                "values_fully_decoded_count": sum(1 for r in recovered
+                                                  if r["value_confidence"] == "high"),
                 "by_pool": pools,
                 "by_table": by_table,
                 "tables_targeted": sorted(targets),
             },
         }
+
+    # ---- value-plausibility, learned from the live table ----
+    #
+    # The affinity check validates serial *types*, so an INTEGER column accepts any
+    # integer however absurd: a misaligned partial record was reporting
+    # `show_on_history = 84521` for a column that can only hold 0 or 1, while being
+    # graded "high" because its extent was structurally confirmed. Extent
+    # confidence and value confidence are different claims and are now reported
+    # separately, with this check backing the second one.
+    #
+    # The domain is learned from the rows the table still holds rather than
+    # hard-coded, and only for columns whose live values form a narrow enum/boolean
+    # set. Anything wider is left alone: a deleted row may legitimately carry a
+    # timestamp or an amount outside the surviving range, and flagging that would
+    # discard real evidence.
+    MAX_ENUM_CARDINALITY = 8
+    ENUM_VALUE_CEILING = 16
+
+    def _live_enum_domains(self, table: str) -> Dict[int, set]:
+        """{column index -> permitted values} for boolean/enum-like columns."""
+        try:
+            with SQLiteReader(self.db_path) as db:
+                cols = db.columns(table)
+                if not cols:
+                    return {}
+                rows = db.conn.execute(f'SELECT * FROM "{table}"').fetchall()
+        except Exception:
+            return {}
+        if len(rows) < 4:                     # too few rows to infer a domain
+            return {}
+        domains: Dict[int, set] = {}
+        for i in range(len(cols)):
+            seen = set()
+            ok = True
+            for r in rows:
+                v = r[i] if i < len(r) else None
+                if v is None:
+                    continue
+                if not isinstance(v, int) or isinstance(v, bool) or abs(v) > self.ENUM_VALUE_CEILING:
+                    ok = False
+                    break
+                seen.add(v)
+                if len(seen) > self.MAX_ENUM_CARDINALITY:
+                    ok = False
+                    break
+            if ok and seen:
+                domains[i] = seen
+        return domains
+
+    def _implausible_columns(self, values: Sequence[Any], columns: Sequence[str],
+                             domains: Dict[int, set]) -> List[str]:
+        out: List[str] = []
+        for i, v in enumerate(values):
+            if v is None or i not in domains or i >= len(columns):
+                continue
+            if isinstance(v, int) and not isinstance(v, bool) and v not in domains[i]:
+                out.append(columns[i])
+        return out
 
     # ---- live-row comparison ----
     def _live_fingerprints(self, table: str) -> "_LiveIndex":

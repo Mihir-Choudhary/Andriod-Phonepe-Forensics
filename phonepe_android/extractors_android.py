@@ -1,22 +1,28 @@
 """
 PhonePe Android Forensics — Extractors
 =====================================
-Each ``extract_*(paths: AndroidCasePaths)`` returns the SAME normalized dict shape as the
-iOS extractors (see phonepe-android-port/CONTRACT.md), so the platform-agnostic correlator /
-hunt / reports / GUI consume them unchanged.
+Each ``extract_*(paths: AndroidCasePaths)`` returns the SAME normalized dict shape the
+platform-agnostic layer expects, so the correlator / hunt / reports / GUI consume them
+unchanged.
 
-SCAFFOLD STATUS:
-  * extract_transactions  — REAL, complete (transaction_core + attrs + tstore_data JSON).
-  * extract_identity      — REAL, minimal (accounts/users; expand with shared_prefs later).
-  * everything else       — TODO (next session). Add following the same pattern + CONTRACT.md.
+STATUS: all extractors registered in ``AndroidCase.EXTRACTORS`` are implemented and have been
+run against a real ``com.phonepe.app`` acquisition. An extractor never raises: a missing
+database or table is reported in the module's own ``errors`` list (surfaced on the Audit page
+via ``Case.extraction_errors``) so that "no data" is always distinguishable from "not read".
+
+Coverage caveat worth knowing before concluding something is absent: table access is guarded
+by ``db.has_table(...)``, so a table this acquisition does not have contributes zero rows
+without raising anything. Cross-check the ``raw_tables`` inventory when it matters.
 """
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter, defaultdict
 from typing import Any, Dict, List
 
 from .core_android import (
+    SUCCESS_STATES,
     AndroidCasePaths,
     SQLiteReader,
     amount_to_rupees,
@@ -29,6 +35,7 @@ from .core_android import (
     pick,
     read_shared_pref,
     safe_int,
+    tri_bool,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,7 +55,37 @@ _DIRECTION_BY_TYPE = {
 MONEY_TYPES = {"RECEIVED_PAYMENT", "SENT_PAYMENT", "PIEDPIPER_PAYMENT", "EXPENSE_SETTLEMENT"}
 
 
+# Types whose name states the direction outright. Anything else has its direction
+# resolved from the payload, because the type default is only a guess.
+_SELF_EVIDENT_TYPES = {"RECEIVED_PAYMENT", "SENT_PAYMENT", "P2P_ENRICHMENT"}
+
+
 def _direction(ttype: str, tstore: Dict[str, Any]) -> str:
+    """Resolve which way the money moved.
+
+    ``tstore.actor`` is the authoritative signal where it exists: it records whether
+    the device's owner was the SENDER or the RECEIVER of this payment. It is used in
+    preference to the per-type default for any type whose name does not already state
+    the direction.
+
+    This was verified against ground truth. PhonePe keeps its own per-transaction
+    ledger in ``transaction_aggregate_entity`` (aggregate_type = received/spent); the
+    static ``PIEDPIPER_PAYMENT -> OUT`` default — whose own comment said "refine when
+    sampled" — disagreed with it on 4 of 8 PiedPiper rows, every one of which the app
+    itself recorded as *received*. `actor` agrees with the app on all of them.
+    """
+    if isinstance(tstore, dict) and ttype not in _SELF_EVIDENT_TYPES:
+        actor = str(tstore.get("actor") or "").strip().upper()
+        if actor == "RECEIVER":
+            return "IN"
+        if actor == "SENDER":
+            return "OUT"
+        # Corroborating shape: the payload names the *other* party, so whichever of
+        # these is present says which side the owner was on.
+        if tstore.get("paymentPayerParty"):
+            return "IN"
+        if tstore.get("paymentReceiver"):
+            return "OUT"
     d = _DIRECTION_BY_TYPE.get(ttype)
     if d:
         return d
@@ -74,6 +111,26 @@ def _amount_paise(tstore: Dict[str, Any], instruments: Any, cp: Dict[str, Any], 
         if n >= 0:
             return n
     return -1
+
+
+def _rank_counterparties(agg: Dict[Any, Dict[str, Any]], direction: str,
+                         top: int = 20) -> List[Dict[str, Any]]:
+    """Top counterparties for one direction, ranked by total amount."""
+    rows = []
+    for (d, stable), slot in agg.items():
+        if d != direction:
+            continue
+        rows.append({
+            "name": slot["name"] or stable[1],
+            "kind": slot["kind"],
+            "count": slot["count"],
+            "amount_inr": slot["amount_inr"],
+            # Prefixed so the UI can label each identifier's type without guessing.
+            "identifiers": sorted(slot["identifiers"]),
+            "grouped_by": stable[0],
+        })
+    rows.sort(key=lambda r: (-r["amount_inr"], -r["count"], str(r["name"])))
+    return rows[:top]
 
 
 def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
@@ -129,6 +186,14 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
 
     statuses, types, dir_count = Counter(), Counter(), Counter()
     counterparties: Counter = Counter()
+    # Per-counterparty totals keyed on a STABLE identifier (PhonePe userId, then full
+    # phone, then VPA) rather than on the display name, which is the same rule the
+    # social graph follows: two people can share a name, and one person's name is
+    # spelled several ways across the tables. `counterparties` above stays
+    # name-keyed for the existing "most frequent" list; these drive the dashboard's
+    # amount-ranked panel, which was rendering nothing because nothing ever
+    # populated it.
+    cp_agg: Dict[Any, Dict[str, Any]] = {}
     yearly_in, yearly_out, monthly = defaultdict(float), defaultdict(float), defaultdict(float)
     total_in = total_out = 0.0
     earliest = latest = None
@@ -162,12 +227,27 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
             # else: self on both/neither side — keep the _DIRECTION_BY_TYPE default (OUT)
 
         # Resolve counterparty vs self legs by direction.
+        #
+        # `paymentPayerParty` / `paymentReceiver` are preferred where present: they
+        # name the OTHER party in full — accountHolderName, phone, fullVpa, userId —
+        # whereas on these payloads the plain from/to legs carry `type: PHONE` with a
+        # null name. Reading only from/to lost real counterparty names the acquisition
+        # actually holds, and on rows where the owner was the receiver it took the
+        # phone number out of the `to` leg — which is the OWNER's number — and
+        # presented it as the counterparty's.
         if direction == "IN":
-            cp = first_or_dict(tstore.get("from"))
+            cp = (first_or_dict(tstore.get("paymentPayerParty"))
+                  or first_or_dict(tstore.get("from")))
             self_leg = first_or_dict(tstore.get("receivedIn")) or first_or_dict(tstore.get("to"))
         else:
-            cp = first_or_dict(tstore.get("to"))
-            self_leg = first_or_dict(tstore.get("paidFrom")) or first_or_dict(tstore.get("receivedIn"))
+            cp = (first_or_dict(tstore.get("paymentReceiver"))
+                  or first_or_dict(tstore.get("to")))
+            self_leg = (first_or_dict(tstore.get("paidFrom"))
+                        or first_or_dict(tstore.get("receivedIn")))
+            # On an owner-as-sender payload with no paidFrom/receivedIn leg, `from` is
+            # the owner. Without this the self columns come back empty on those rows.
+            if not self_leg and str(tstore.get("actor") or "").upper() == "SENDER":
+                self_leg = first_or_dict(tstore.get("from"))
 
         amount_paise = _amount_paise(tstore, instruments, cp, self_leg)
         amount_inr = amount_to_rupees(amount_paise) if amount_paise >= 0 else None
@@ -240,7 +320,46 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
         if cp_name:
             counterparties[str(cp_name)] += 1
 
-        is_success = state.upper() in ("COMPLETED", "SUCCESS", "SETTLED")
+        # Same vocabulary the correlator uses, so a module summary and the
+        # correlator's totals can never disagree about what "succeeded" means.
+        is_success = state.strip().upper() in SUCCESS_STATES
+
+        # Amount-ranked counterparty aggregation, per direction, successful only.
+        if is_success and amount_inr is not None and direction in ("IN", "OUT"):
+            full_phone = cp_phone_full or (cp_phone if not _is_masked(cp_phone) else None)
+            stable = (("uid", cp_user_id) if cp_user_id else
+                      ("ph", _last10(full_phone)) if full_phone else
+                      ("vpa", str(cp_vpa).lower()) if cp_vpa else
+                      ("name", str(cp_name).lower()) if cp_name else None)
+            if stable:
+                slot = cp_agg.setdefault((direction, stable), {
+                    "name": None, "kind": "Peer", "count": 0, "amount_inr": 0.0,
+                    "identifiers": set(),
+                })
+                # Label preference: a recovered real name always wins, then any
+                # non-masked name, then whatever we have. `_is_masked` is not enough
+                # to test the incumbent on its own — when a masked name was replaced
+                # by a bare phone number upstream, that number reads as "not masked"
+                # and would otherwise lock out a real name recovered from a later row.
+                incumbent = slot["name"]
+                incumbent_weak = (not incumbent or _is_masked(incumbent)
+                                  or str(incumbent).replace("+", "").isdigit())
+                if cp_resolved and (incumbent_weak or not slot.get("name_recovered")):
+                    slot["name"] = cp_resolved
+                    slot["name_recovered"] = True
+                elif cp_name and incumbent_weak:
+                    slot["name"] = cp_name
+                if cp.get("type") == "MERCHANT" or cp.get("firstPartyMerchant"):
+                    slot["kind"] = "Merchant"
+                slot["count"] += 1
+                slot["amount_inr"] = round(slot["amount_inr"] + amount_inr, 2)
+                if cp_user_id:
+                    slot["identifiers"].add(f"uid:{cp_user_id}")
+                if full_phone:
+                    slot["identifiers"].add(f"ph:{full_phone}")
+                if cp_vpa:
+                    slot["identifiers"].add(f"vpa:{cp_vpa}")
+
         if amount_inr is not None and is_success:
             if direction == "IN":
                 total_in += amount_inr
@@ -280,6 +399,15 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
             "counterparty_vpa": cp_vpa,
             "counterparty_user_id": cp_user_id,
             "counterparty_user_type": cp.get("type"),
+            # Merchant vs person, from the counterparty leg's own type rather than
+            # guessed from the name. The transactions table has always had a tag for
+            # this; nothing populated it, so it never rendered.
+            "classification": ("MERCHANT" if (cp.get("type") == "MERCHANT"
+                                              or cp.get("firstPartyMerchant"))
+                               else "PEER_TO_PEER" if ttype in ("SENT_PAYMENT",
+                                                                "RECEIVED_PAYMENT")
+                               else "SPLIT_SETTLEMENT" if ttype == "EXPENSE_SETTLEMENT"
+                               else None),
             "counterparty_cbs_name": cp.get("cbsName") or cp.get("accountHolderName"),
             "self_account_holder": self_holder,
             "self_account_masked": self_acct,
@@ -288,6 +416,25 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
             "instrument_id": self_leg.get("instrumentId"),
             "utr": self_leg.get("utr"),
             "transfer_mode": ctx.get("transferMode") or tags.get("context.transferMode"),
+            # How the payment was initiated. The transactions table has always had QR
+            # and INTENT tags; nothing set these keys, so like `classification` before
+            # them they could never render — while `tstore.context` states the mode
+            # outright. Forensically this is the difference between scanning a code in
+            # person and being handed off from another app.
+            #
+            # True only where the app itself named the mode. False only where it named a
+            # *different* one. Absent ⇒ None (unknown), never False: 48 rows carry no
+            # `initiationMode` at all, and calling those "not a QR scan" would assert
+            # more than the record says. The raw NPCI code is kept beside it, unmapped —
+            # on this acquisition INTENT↔"04" (7/7) and QR_SCAN↔"01" (1/1) correspond
+            # exactly, but that is an observation about one device, not a code table to
+            # decode future acquisitions with.
+            "initiation_mode": ctx.get("initiationMode"),
+            "upi_initiation_mode": ctx.get("upiInitiationMode"),
+            "is_qr_scan": (None if ctx.get("initiationMode") is None
+                           else ctx.get("initiationMode") == "QR_SCAN"),
+            "is_intent": (None if ctx.get("initiationMode") is None
+                          else ctx.get("initiationMode") == "INTENT"),
             "context_tag": ctx.get("tag"),
             "response_code": tstore.get("responseCode") or self_leg.get("transactionResponseCode"),
             "merchant_id": cp.get("merchantId") if cp.get("type") == "MERCHANT" else None,
@@ -303,7 +450,12 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
             "created_at": ts,
             "updated_at": ts_upd,
             "id_embedded_ts": decoded_id,
-            "dismissed": not bool(r.get("show_on_history", 1)),
+            # `None` means the column is absent from this acquisition's schema (the
+            # reader blanks pruned columns), which is not the same as "hidden from
+            # history" — defaulting it to dismissed would mark every transaction
+            # dismissed on a schema where the column was renamed.
+            "dismissed": (False if r.get("show_on_history") is None
+                          else not bool(r.get("show_on_history"))),
             "is_internal": bool(safe_int(tags.get("isInternalPayment"))),
             "raw_data": tstore if isinstance(tstore, dict) else None,
             "raw_tags": tags or None,
@@ -316,6 +468,10 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
         "state_breakdown": dict(statuses),
         "direction_breakdown": dict(dir_count),
         "top_counterparties": counterparties.most_common(20),
+        # Amount-ranked, identifier-keyed, split by direction — consumed by the
+        # dashboard's "Top Counterparties" panel.
+        "top_counterparties_received": _rank_counterparties(cp_agg, "IN"),
+        "top_counterparties_sent": _rank_counterparties(cp_agg, "OUT"),
         "earliest_txn": earliest,
         "latest_txn": latest,
         "total_received_inr": round(total_in, 2),
@@ -343,6 +499,18 @@ def extract_transactions(paths: AndroidCasePaths) -> Dict[str, Any]:
 def _last10(s: Any) -> Any:
     digits = "".join(c for c in str(s or "") if c.isdigit())
     return digits[-10:] if len(digits) >= 10 else (digits or None)
+
+
+def _not_none_str(v: Any) -> Any:
+    """Some Android stores write the literal text "None"/"null" for an empty column.
+
+    Returned as a real absence, so a report cannot print the string "None" as if it
+    were the subject's name.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    return None if s in ("", "None", "null", "NULL", "nil") else v
 
 
 def _is_masked(s: Any) -> bool:
@@ -524,7 +692,7 @@ def extract_contacts(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "verified_name": names.get(c.get("connection_id")) or c.get("cbs_name"),
                     "external_vpa": None,
                     "external_vpa_name": c.get("cbs_name"),
-                    "on_phonepe": bool(c.get("on_phonepe")),
+                    "on_phonepe": tri_bool(c.get("on_phonepe")),
                     "upi_state": c.get("upi_status"),
                     "country_code": c.get("countryCode"),
                     "region": c.get("region"),
@@ -543,8 +711,13 @@ def extract_contacts(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "verified_name": c.get("nick_name") or c.get("cbs_name"),
                     "external_vpa": c.get("contact_vpa"),
                     "external_vpa_name": c.get("cbs_name"),
-                    "on_phonepe": True,
-                    "upi_state": "ENABLED",
+                    # `vpa_contacts` has no on_phonepe / upi_status column, so neither
+                    # can be stated from it. They were hard-coded True/"ENABLED",
+                    # which asserts a fact the evidence does not contain — and is
+                    # plainly wrong for a VPA at another PSP (…@axl is Axis, not
+                    # PhonePe). Unknown is reported as unknown.
+                    "on_phonepe": None,
+                    "upi_state": None,
                     "country_code": None, "region": None,
                     "last_synced": normalize_timestamp(c.get("updated_at")),
                     "photo_url": c.get("phonepe_image_url") or None,
@@ -563,11 +736,40 @@ def extract_contacts(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "verified_name": p.get("name") or p.get("cbsName"),
                     "external_vpa": dest if is_vpa else None,
                     "external_vpa_name": p.get("cbsName"),
-                    "on_phonepe": True, "upi_state": None,
+                    # Same reasoning as vpa_contacts: paymentProfileCache states no
+                    # PhonePe-membership flag, so none is claimed.
+                    "on_phonepe": None, "upi_state": None,
                     "country_code": None, "region": None,
                     "last_synced": None, "photo_url": None,
                     "source": "paymentProfileCache",
                 })
+        # nonContact — connections the subject interacted with that are NOT saved
+        # contacts. The module header has always claimed this table; nothing read it.
+        # `CONTACT_SEARCH` rows are numbers the subject looked up inside PhonePe, and
+        # a searched-for number that was never saved is exactly the kind of link an
+        # investigation wants. Kept as its own list rather than merged into contacts,
+        # because these people are precisely *not* in the address book.
+        if db.has_table("nonContact"):
+            for c in db.query("SELECT connectionId, useCaseName, phoneNumber, isKnown, "
+                              "isHidden, isPhoneContact, changeState, countryCode, "
+                              "region FROM nonContact"):
+                if "_error" in c:
+                    out["errors"].append(c["_error"])
+                    continue
+                phone = _not_none_str(c.get("phoneNumber"))
+                out.setdefault("non_contacts", []).append({
+                    "connect_id": c.get("connectionId"),
+                    "use_case": c.get("useCaseName"),
+                    "phone": phone,
+                    "phone_last10": _last10(phone) if phone else None,
+                    "known": bool(safe_int(c.get("isKnown"))),
+                    "hidden": bool(safe_int(c.get("isHidden"))),
+                    "is_phone_contact": bool(safe_int(c.get("isPhoneContact"))),
+                    "country_code": _not_none_str(c.get("countryCode")),
+                    "region": _not_none_str(c.get("region")),
+                    "source": "nonContact",
+                })
+
         # Phonebook ← phone_book_contacts JOIN metadata (display_name) by lookup.
         meta: Dict[str, Dict[str, Any]] = {}
         if db.has_table("phone_book_contacts_metadata"):
@@ -595,13 +797,71 @@ def extract_contacts(paths: AndroidCasePaths) -> Dict[str, Any]:
                 })
     cyc = out["cyclops_contacts"]
     pb = out["phonebook_contacts"]
+    # A person can appear in phone_contacts, vpa_contacts AND paymentProfileCache,
+    # so the row count is a count of source records, not of people. Both are
+    # reported: the row count says how much evidence there is, the distinct count
+    # says how many people it describes. Reporting only the former inflates
+    # "contacts" by ~60% on a real acquisition.
+    def _identity_key(c: Dict[str, Any]) -> Any:
+        return (c.get("connect_id") or c.get("phone")
+                or c.get("external_vpa") or id(c))
+    distinct_people = {_identity_key(c) for c in cyc}
+    on_phonepe_people = {_identity_key(c) for c in cyc if c.get("on_phonepe")}
+
+    # The source stores many people twice — once as `9876543210` and once as
+    # `+919876543210`, under ONE connection_id — and the two rows do not always
+    # agree: on this acquisition 5 people carry contradictory `on_phonepe` and 7
+    # contradictory `upi_status`. Both rows are kept (they are what the evidence
+    # says) but the disagreement is reported, because a contacts page showing the
+    # same number twice with opposite answers and no explanation invites the analyst
+    # to pick one at random.
+    by_person: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for c in cyc:
+        by_person[_identity_key(c)].append(c)
+    conflicts = []
+    for key, group in by_person.items():
+        if len(group) < 2:
+            continue
+        for field in ("on_phonepe", "upi_state"):
+            values = {c.get(field) for c in group if c.get(field) is not None}
+            if len(values) > 1:
+                conflicts.append({
+                    "identity": str(key),
+                    "field": field,
+                    # NOT "values": in a Jinja template `row.values` resolves to the
+                    # dict's own .values() method, not to a key of that name, so a
+                    # key called "values" renders as a bound method (or raises).
+                    "conflicting_values": sorted(str(v) for v in values),
+                    "phones": sorted({str(c.get("phone")) for c in group if c.get("phone")}),
+                    "note": "the acquisition's own rows for this person disagree; "
+                            "both are listed, neither is preferred",
+                })
+    for c in cyc:
+        c["source_rows_for_person"] = len(by_person[_identity_key(c)])
+    out["source_conflicts"] = conflicts
     out["summary"].update({
-        "cyclops_total": len(cyc),
+        # One convention for the headline pair: both count PEOPLE, so "X on PhonePe
+        # of Y contacts" compares like with like. The row counts are kept under
+        # explicit *_source_rows names — mixing the two under sibling labels made
+        # the page read "151 of 298", comparing people against source records.
+        "cyclops_total": len(distinct_people),
+        "cyclops_distinct": len(distinct_people),
+        "cyclops_source_rows": len(cyc),
         "phonebook_total": len(pb),
-        "on_phonepe_count": sum(1 for c in cyc if c.get("on_phonepe")),
+        "on_phonepe_count": len(on_phonepe_people),
+        "on_phonepe_source_rows": sum(1 for c in cyc if c.get("on_phonepe")),
         "has_external_vpa_count": sum(1 for c in cyc if c.get("external_vpa")),
         "deleted_contacts": sum(1 for c in pb if c.get("deleted")),
         "external_image_count": 0,
+        "non_contact_count": len(out.get("non_contacts") or []),
+        "non_contact_with_phone": sum(1 for c in (out.get("non_contacts") or [])
+                                      if c.get("phone")),
+        "non_contact_searched": sum(1 for c in (out.get("non_contacts") or [])
+                                    if c.get("use_case") == "CONTACT_SEARCH"),
+        "source_conflict_count": len(conflicts),
+        "on_phonepe_basis": "counted only where a source row states on_phonepe; "
+                            "vpa_contacts and paymentProfileCache state no such flag "
+                            "and are counted as unknown, not as members",
     })
     return out
 
@@ -693,10 +953,27 @@ def extract_chat(paths: AndroidCasePaths) -> Dict[str, Any]:
                 member_name[mid] = nm
                 member_masked[mid] = m.get("maskedPhoneNumber")
                 is_self = (mid == own_by_topic.get(topic))
+                # Masked→real recovery for participants, the same resolution the
+                # message rows already get. Without it the participants table showed
+                # a masked number next to "full number not recoverable" even where
+                # the connection id resolves to a full phone in the contact tables —
+                # a claim that was not merely incomplete but wrong.
+                mres = resolver.by_member(mid) or {}
+                nm_masked = _is_masked(nm) or not nm
                 rec = {
                     "z_pk": mid, "group_pk": topic, "group_id": topic,
-                    "phonepe_user": bool(m.get("onPhonePe")),
+                    "phonepe_user": tri_bool(m.get("onPhonePe")),
                     "display_name": nm, "masked_phone": m.get("maskedPhoneNumber"),
+                    # Recover whenever this record lacks a usable full number, not
+                    # only when a masked one was stored: a member with no phone at
+                    # all is equally unresolved, and gating on "was it masked"
+                    # silently skipped those.
+                    "phone_full": (mres.get("phone")
+                                   if _is_masked(m.get("maskedPhoneNumber"))
+                                   or not m.get("maskedPhoneNumber") else None),
+                    "name_resolved": mres.get("name") if nm_masked else None,
+                    "name_resolved_source": mres.get("name_source") if nm_masked else None,
+                    "resolved_names": mres.get("names") if nm_masked else None,
                     "role": m.get("role"),
                     "state": "DELETED" if m.get("isMemberDeleted") else "ACTIVE",
                     "added_on": None,
@@ -833,6 +1110,11 @@ def extract_chat(paths: AndroidCasePaths) -> Dict[str, Any]:
 def extract_payment_infra(paths: AndroidCasePaths) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "linked_accounts": [], "linked_vpas": [], "psp_handles": [], "upi_lite": None,
+        # Declared here, like upi_lite, so the contract is complete whether or not the
+        # records exist. The templates guard on them either way; the point is that a
+        # StrictUndefined audit sweep then flags only keys that are genuinely
+        # undeclared, instead of 500ing on optional-but-expected ones.
+        "upi_container": None, "upi_international": None, "approvers_recent": [],
         "linked_cards": [], "wallet": None, "external_wallets": [], "supported_banks": [],
         "summary": {}, "errors": [],
     }
@@ -906,8 +1188,38 @@ def extract_payment_infra(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "ccupi": bool(b.get("credit_card_on_upi_supported")), "lite": bool(b.get("upi_lite_supported")),
                     "active": bool(b.get("active")), "partner": bool(b.get("partner")),
                 })
+        # `approvers_table` — UPI mandate / family-account approvers: another
+        # person authorised to approve this account's payments, which is a real
+        # association between two people. The payment-infra page has always had a
+        # panel for it reading `approvers_recent`, but nothing ever set that key,
+        # so the panel could not render even where the table had rows. Empty on
+        # the 2026-07-30 acquisition (0 rows) — wired so it is empty because the
+        # evidence is empty, not because the code never looked.
+        if db.has_table("approvers_table"):
+            for a in db.query("SELECT approver_vpa, contact_name, contact_number, approver_type, "
+                              "state, linking_type, expiry_ts, is_consent_needed, "
+                              "full_mandate_state, full_mandate_amount, full_umn, "
+                              "full_relationship_type, full_linking_time FROM approvers_table"):
+                if "_error" in a:
+                    continue
+                out["approvers_recent"].append({
+                    "approver_vpa": a.get("approver_vpa"),
+                    "contact_name": a.get("contact_name"),
+                    "contact_number": _last10(a.get("contact_number")),
+                    "type": a.get("approver_type"),
+                    "state": a.get("state"),
+                    "linking_type": a.get("linking_type"),
+                    "expiry": normalize_timestamp(a.get("expiry_ts")),
+                    "linked_at": normalize_timestamp(a.get("full_linking_time")),
+                    "consent_needed": tri_bool(a.get("is_consent_needed")),
+                    "mandate_state": a.get("full_mandate_state"),
+                    "mandate_amount_inr": amount_to_rupees(a.get("full_mandate_amount")),
+                    "mandate_umn": a.get("full_umn"),
+                    "relationship_type": a.get("full_relationship_type"),
+                })
     out["linked_vpas"] = sorted(vpas)
     out["summary"].update({
+        "approver_count": len(out["approvers_recent"]),
         "linked_account_count": len(out["linked_accounts"]),
         "linked_vpa_count": len(out["linked_vpas"]),
         "psp_count": len(out["psp_handles"]),
@@ -922,8 +1234,78 @@ def extract_payment_infra(paths: AndroidCasePaths) -> Dict[str, Any]:
 # Notifications  (BullhornDatabase: topic / messageDataStore)
 # ---------------------------------------------------------------------------
 
+def _b64_json(value: Any) -> Any:
+    """Bullhorn wraps a message's real content as base64-encoded JSON.
+
+    Padding is restored before decoding: the stored strings have had their `=`
+    padding stripped (they arrive as `\\u003d` escapes in JSON and are trimmed),
+    which makes a strict b64decode raise on perfectly good content.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    import base64
+    raw = value.strip()
+    try:
+        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4))
+    except Exception:
+        return None
+    try:
+        return json.loads(decoded)
+    except Exception:
+        return None
+
+
+def _notification_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull the human-visible parts out of a decoded Bullhorn push payload.
+
+    Two families occur. A catalogue-sync instruction (`{id, system, operation,
+    key}`) is machine chatter. An inbox notification carries a templated
+    placement whose params hold the title/subtitle the user actually saw and the
+    deeplink tapping it would have opened — that is the evidential part.
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(payload, dict):
+        return out
+    if payload.get("system") and payload.get("operation"):
+        out["kind"] = f"{payload.get('system')}/{payload.get('operation')}"
+        out["sync_key"] = payload.get("key")
+        return out
+    if payload.get("type"):
+        out["kind"] = payload["type"]
+    for placement in ((payload.get("data") or {}).get("placements") or []):
+        if not isinstance(placement, dict):
+            continue
+        tmpl = placement.get("template") or {}
+        params = ((tmpl.get("templateParams") or {}).get("value") or {})
+        out.setdefault("template", tmpl.get("templateId"))
+        for src, dst in (("title", "title"), ("subTitle", "subtitle"),
+                         ("message", "body"), ("body", "body")):
+            if params.get(src) and not out.get(dst):
+                out[dst] = params[src]
+        nav = (tmpl.get("nav") or {}).get("params") or {}
+        for key in ("deepLink", "deepLinkIOS", "deeplink"):
+            if nav.get(key) and not out.get("deeplink"):
+                out["deeplink"] = nav[key]
+        if not out.get("deeplink"):
+            for entry in (((nav.get("redirection_data") or {}).get("data")) or []):
+                if isinstance(entry, dict) and entry.get("key") == "url" and entry.get("value"):
+                    out["deeplink"] = entry["value"]
+                    break
+        if out.get("title"):
+            break
+    out.setdefault("kind", "NOTIFICATION" if out.get("title") else "unclassified")
+    return out
+
+
+# A decoded payload is kept per message so the content is auditable, but the
+# catalogue-sync family repeats the same four fields thousands of times, so only
+# the notification family keeps its full payload.
+_MAX_STORED_MESSAGES = 25_000
+
+
 def extract_notifications(paths: AndroidCasePaths) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"topics": [], "raw_messages": [], "summary": {}, "errors": []}
+    out: Dict[str, Any] = {"topics": [], "raw_messages": [], "message_ops": [],
+                           "summary": {}, "errors": []}
     db_path = paths.db("BullhornDatabase")
     if not db_path:
         out["errors"].append("BullhornDatabase not found")
@@ -931,13 +1313,77 @@ def extract_notifications(paths: AndroidCasePaths) -> Dict[str, Any]:
     out["summary"]["db_sha256"] = hash_file(db_path)
     subsystem_bd: Counter = Counter()
     storage_bd: Counter = Counter()
+    kind_bd: Counter = Counter()
     with SQLiteReader(db_path) as db:
+        # Stored message bodies. `message` holds the operation log (a handful of
+        # rows); `messageDataStore` holds the actual delivered payloads, and it was
+        # previously never read at all — the provenance page claimed it as a source
+        # while the extractor only counted `message`, so thousands of delivered
+        # notifications were invisible outside the raw-table browser.
+        if db.has_table("messageDataStore"):
+            for r in db.query("SELECT messageId, data FROM messageDataStore"):
+                if "_error" in r:
+                    out["errors"].append(r["_error"])
+                    continue
+                if len(out["raw_messages"]) >= _MAX_STORED_MESSAGES:
+                    out["errors"].append(
+                        f"messageDataStore truncated at {_MAX_STORED_MESSAGES} rows")
+                    break
+                envelope = decode_json_blob(r.get("data"))
+                msg = (envelope or {}).get("message") if isinstance(envelope, dict) else {}
+                msg = msg if isinstance(msg, dict) else {}
+                payload = _b64_json(msg.get("payload"))
+                content = _notification_content(payload or {})
+                kind_bd[content.get("kind") or "?"] += 1
+                is_notification = bool(content.get("title") or content.get("body"))
+                out["raw_messages"].append({
+                    "message_id": msg.get("id") or r.get("messageId"),
+                    "server_id": msg.get("serverId"),
+                    "topic_id": msg.get("topicId"),
+                    "kind": content.get("kind"),
+                    "title": content.get("title"),
+                    "subtitle": content.get("subtitle"),
+                    "body": content.get("body"),
+                    "deeplink": content.get("deeplink"),
+                    "template": content.get("template"),
+                    "sync_key": content.get("sync_key"),
+                    "created_at": normalize_timestamp(msg.get("created")),
+                    "updated_at": normalize_timestamp(msg.get("updated")),
+                    "expiry_at": normalize_timestamp(msg.get("expiry")),
+                    "sent_at": normalize_timestamp((payload or {}).get("sentAt")),
+                    "expires_at": normalize_timestamp((payload or {}).get("expiresAt")),
+                    "is_notification": is_notification,
+                    "payload_undecodable": msg.get("payload") is not None and payload is None,
+                    # Full payload only where it carries distinct content.
+                    "payload": payload if is_notification else None,
+                })
+        if db.has_table("message"):
+            for r in db.query("SELECT messageId, topicId_M, messageOperationType, "
+                              "messageOperationData, createdTimeStamp, updateTimeStamp, "
+                              "typeOfSubscriberType_M FROM message"):
+                if "_error" in r:
+                    continue
+                op = decode_json_blob(r.get("messageOperationData"))
+                inner = (op or {}).get("message") if isinstance(op, dict) else {}
+                out["message_ops"].append({
+                    "message_id": r.get("messageId"),
+                    "topic_id": r.get("topicId_M"),
+                    "operation": r.get("messageOperationType"),
+                    "subscriber_type": r.get("typeOfSubscriberType_M"),
+                    "created_at": normalize_timestamp(r.get("createdTimeStamp")),
+                    "updated_at": normalize_timestamp(r.get("updateTimeStamp")),
+                    "payload": _b64_json((inner or {}).get("payload")),
+                })
         # message counts per topic
         msg_count: Dict[str, int] = {}
         if db.has_table("message"):
             for r in db.query("SELECT topicId_M, COUNT(*) c FROM message GROUP BY topicId_M"):
                 if "_error" not in r:
                     msg_count[r.get("topicId_M")] = r.get("c")
+        # Delivered-payload counts per topic, which is the number that reflects how
+        # much actually arrived on this topic.
+        stored_count: Counter = Counter(m["topic_id"] for m in out["raw_messages"]
+                                        if m.get("topic_id"))
         if db.has_table("topic"):
             for t in db.query("SELECT topicId, subSystemType, messageStorageType, singleUse, "
                               "topicCreatedTimeStamp, topicUpdateTimeStamp, messageExpiry, "
@@ -958,11 +1404,22 @@ def extract_notifications(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "status": None,
                     "last_sync": normalize_timestamp(t.get("lastMessageSyncTime")),
                     "raw_message_count": msg_count.get(t.get("topicId"), 0),
+                    "stored_message_count": stored_count.get(t.get("topicId"), 0),
                 })
+    notifications = [m for m in out["raw_messages"] if m["is_notification"]]
+    dated = sorted(m["created_at"]["iso"] for m in out["raw_messages"] if m.get("created_at"))
     out["summary"].update({
         "topic_count": len(out["topics"]),
         "subsystem_breakdown": dict(subsystem_bd),
         "storage_type_breakdown": dict(storage_bd),
+        "stored_message_count": len(out["raw_messages"]),
+        "notification_count": len(notifications),
+        "message_operation_count": len(out["message_ops"]),
+        "payload_kind_breakdown": dict(kind_bd.most_common(25)),
+        "undecodable_payloads": sum(1 for m in out["raw_messages"]
+                                    if m["payload_undecodable"]),
+        "earliest_message": dated[0] if dated else None,
+        "latest_message": dated[-1] if dated else None,
     })
     return out
 
@@ -1058,6 +1515,52 @@ def extract_identity(paths: AndroidCasePaths) -> Dict[str, Any]:
                         })
     else:
         out["errors"].append("phonepe_core not found")
+
+    # --- accounts_db: the Android account-manager record for the signed-in user ---
+    # This database had no extractor at all, yet it holds the subject's own user id,
+    # e-mail and — unlike almost everything else in the acquisition — an UNMASKED
+    # full phone number, next to a masked `user_name`. Identifying the account
+    # holder is the first question asked of an exhibit, so it is read here rather
+    # than left to the raw-table browser.
+    accounts_db = paths.db("accounts_db")
+    if accounts_db:
+        with SQLiteReader(accounts_db) as db:
+            if db.has_table("account"):
+                for a in db.query("SELECT user_id, user_display_name, user_name, "
+                                  "user_phone_number, user_email, email_verified, "
+                                  "phone_number_verified FROM account"):
+                    if "_error" in a:
+                        out["errors"].append(f"accounts_db: {a['_error']}")
+                        continue
+                    acct: Dict[str, Any] = {
+                        "user_id": a.get("user_id"),
+                        # 'None' arrives as the literal string in this store.
+                        "display_name": _not_none_str(a.get("user_display_name")),
+                        "user_name": _not_none_str(a.get("user_name")),
+                        "phone": _not_none_str(a.get("user_phone_number")),
+                        "email": _not_none_str(a.get("user_email")),
+                        "email_verified": bool(safe_int(a.get("email_verified"))),
+                        "phone_verified": bool(safe_int(a.get("phone_number_verified"))),
+                        "source": "accounts_db.account",
+                    }
+                    out.setdefault("accounts", []).append(acct)
+                    if acct["phone"] and not _is_masked(acct["phone"]):
+                        phones.add(acct["phone"])
+                    # Its OWN key: Crashlytics also reports a "userId", but that is a
+                    # hashed telemetry id, not this one. Writing both to
+                    # `phonepe_user_id` meant whichever ran second silently replaced
+                    # the other, losing the account identifier that actually appears
+                    # in the evidence (topic names, product.entity_id).
+                    if acct["user_id"]:
+                        out["device_identifiers"].setdefault(
+                            "phonepe_account_user_id", acct["user_id"])
+                    # Only a real name, never the masked `user_name`, may become the
+                    # registered name.
+                    for cand in (acct["display_name"], acct["user_name"]):
+                        if cand and not _is_masked(cand) and not out["registered_name"]:
+                            out["registered_name"] = cand
+                    if acct["email"]:
+                        out.setdefault("emails", []).append(acct["email"])
 
     dev = out["device_identifiers"]
     # --- Crashlytics device/OS/app/user fingerprint ---
@@ -1218,6 +1721,32 @@ def extract_financial(paths: AndroidCasePaths) -> Dict[str, Any]:
                     "starts": normalize_timestamp(o.get("startDate")),
                     "ends": normalize_timestamp(o.get("endDate")),
                 })
+        # Gift-card catalogue. This is the product list PhonePe synced to the
+        # device, NOT vouchers the subject holds — labelled as such, because a
+        # "vouchers" list that reads as holdings would misrepresent it. Surfaced
+        # because the module header claimed this table as a source while never
+        # reading it, the same overstatement messageDataStore had.
+        if db.has_table("voucher_products"):
+            for v in db.query("SELECT product_id, provider_id, issuer_id, name, "
+                              "product_type, price_type, min_price, max_price, status, "
+                              "validity_in_months, created_at FROM voucher_products "
+                              "LIMIT 5000"):
+                if "_error" in v:
+                    continue
+                out["vouchers"].append({
+                    "product_id": v.get("product_id"),
+                    "name": v.get("name"),
+                    "provider": v.get("provider_id"),
+                    "issuer": v.get("issuer_id"),
+                    "type": v.get("product_type"),
+                    "price_type": v.get("price_type"),
+                    "min_inr": amount_to_rupees(v.get("min_price")),
+                    "max_inr": amount_to_rupees(v.get("max_price")),
+                    "status": v.get("status"),
+                    "validity_months": v.get("validity_in_months"),
+                    "created_at": normalize_timestamp(v.get("created_at")),
+                    "kind": "catalogue_product",
+                })
         if db.has_table("fund_sync_lite_table"):
             for f in db.query("SELECT fund_id, fund_name, fund_category, amc_display_name, enabled FROM fund_sync_lite_table LIMIT 5000"):
                 if "_error" in f:
@@ -1229,7 +1758,11 @@ def extract_financial(paths: AndroidCasePaths) -> Dict[str, Any]:
                 })
     out["summary"] = {
         "rewards_count": len(out["rewards"]), "mf_catalogue_count": len(out["mutual_funds"]),
-        "voucher_category_count": 0, "donation_provider_count": 0, "offers_count": len(out["offers"]),
+        # Catalogue sizes, not the subject's holdings — named so they cannot be
+        # misread as "the subject has 713 vouchers".
+        "voucher_catalogue_count": len(out["vouchers"]),
+        "voucher_category_count": 0, "donation_provider_count": 0,
+        "offers_count": len(out["offers"]),
     }
     return out
 
@@ -1354,9 +1887,25 @@ def extract_config_state(paths: AndroidCasePaths) -> Dict[str, Any]:
 
 def extract_recommendations(paths: AndroidCasePaths) -> Dict[str, Any]:
     out: Dict[str, Any] = {"recommendations": [], "products": [], "signals": [], "summary": {}, "errors": []}
-    db_path = paths.db("RecommendationsDatabase")
+    # PhonePe renamed this store: the recommendation engine's product /
+    # recommendation_item / signal tables now live in `MaximusDatabase`, with the
+    # same schema. Looking only for the old name reported "RecommendationsDatabase
+    # not found" on an acquisition that had all of the data, which is the worst
+    # possible failure for this tool — a confident claim that a source is absent.
+    # Both names are tried and the one used is recorded.
+    db_path = None
+    for candidate in ("RecommendationsDatabase", "MaximusDatabase"):
+        db_path = paths.db(candidate)
+        if db_path:
+            break
     if not db_path:
-        out["errors"].append("RecommendationsDatabase not found")
+        out["errors"].append("no recommendations database found "
+                             "(tried RecommendationsDatabase, MaximusDatabase)")
+        # An absent source is not the same as a zero count, so the counts are left
+        # null rather than set to 0 — but the keys must exist, or the page renders a
+        # blank tile with no explanation instead of "no such database".
+        out["summary"] = {"product_count": None, "recommendation_count": None,
+                          "signal_count": None, "source_absent": True}
         return out
     with SQLiteReader(db_path) as db:
         if db.has_table("product"):
@@ -1379,8 +1928,12 @@ def extract_recommendations(paths: AndroidCasePaths) -> Dict[str, Any]:
                 out["signals"].append({"signal_type": s.get("signal_type"),
                                        "timestamp": normalize_timestamp(s.get("signal_timestamp")),
                                        "synced": bool(s.get("is_synced")), "recommendation_pk": s.get("item_id")})
-    out["summary"] = {"db_sha256": hash_file(db_path), "product_count": len(out["products"]),
-                      "recommendation_count": len(out["recommendations"]), "signal_count": len(out["signals"])}
+    out["summary"] = {"db_sha256": hash_file(db_path),
+                      "database": os.path.basename(db_path),
+                      "source_absent": False,
+                      "product_count": len(out["products"]),
+                      "recommendation_count": len(out["recommendations"]),
+                      "signal_count": len(out["signals"])}
     return out
 
 
@@ -1540,6 +2093,7 @@ def extract_media(paths: AndroidCasePaths) -> Dict[str, Any]:
 
 def extract_audit(paths: AndroidCasePaths) -> Dict[str, Any]:
     out: Dict[str, Any] = {"ledger_sync": [], "consents": [], "central_sync": [], "bg_sync_items": [],
+                           "cassini_models": [],
                            "device_info": {}, "summary": {}, "errors": []}
     db_path = paths.db("phonepe_core")
     if db_path:
@@ -1561,15 +2115,85 @@ def extract_audit(paths: AndroidCasePaths) -> Dict[str, Any]:
                         "last_attempt": normalize_timestamp(s.get("lastSyncAttemptTime")),
                         "last_completed": normalize_timestamp(s.get("lastSyncCompletionTime")),
                     })
+            # On-device ML models ← `model_data`. The audit page has always had a
+            # "Cassini" panel for these; nothing set the key, so it could not render.
+            # The audit page's job is disclosing what the app held on device, and
+            # "no models" is only an honest statement if the table was actually read.
+            # Empty on the 2026-07-30 acquisition (0 rows). No checksum column exists
+            # here, so that field stays absent rather than being filled with `key`.
+            if db.has_table("model_data"):
+                for m in db.query("SELECT id, name, version, state, serving_state, "
+                                  "download_uri, directory_uri, created_at, updated_at "
+                                  "FROM model_data"):
+                    if "_error" in m:
+                        continue
+                    out["cassini_models"].append({
+                        "id": m.get("id"), "name": m.get("name"),
+                        "version": m.get("version"),
+                        "local_state": m.get("state"),
+                        "server_state": m.get("serving_state"),
+                        "download_uri": m.get("download_uri"),
+                        "directory_uri": m.get("directory_uri"),
+                        "created_at": normalize_timestamp(m.get("created_at")),
+                        "updated_at": normalize_timestamp(m.get("updated_at")),
+                    })
             # consent (in-core)
             if db.has_table("consent"):
-                for c in db.query("SELECT consentId, dataType, useCaseId, acceptType, consentState, endTime FROM consent"):
+                for c in db.query("SELECT consentId, dataType, useCaseId, acceptType, "
+                                  "consentState, endTime, consentSyncState FROM consent"):
                     if "_error" in c:
                         continue
                     out["consents"].append({
+                        "consent_id": c.get("consentId"),
                         "state": c.get("consentState"), "destination": c.get("dataType"),
-                        "subject_id": c.get("useCaseId"), "end_time": normalize_timestamp(c.get("endTime")),
+                        "accept_type": c.get("acceptType"),
+                        "subject_id": c.get("useCaseId"),
+                        # This table does carry consentSyncState; it simply was not being
+                        # selected, so the column showed empty for these 21 rows while the
+                        # standalone database's rows filled it.
+                        "sync_state": c.get("consentSyncState"),
+                        # Declared None, not omitted: this table has no subjectRefId or
+                        # consentDefinition column, and the two consent sources are merged
+                        # into one list that one template iterates. A key present on some
+                        # records and absent on others makes the same cell mean "empty" for
+                        # one row and "field does not exist" for the next.
+                        "subject_ref": None,
+                        "definition": None,
+                        "end_time": normalize_timestamp(c.get("endTime")),
+                        "source": "phonepe_core.consent",
                     })
+    # The standalone `consent` DATABASE is a separate store from phonepe_core's
+    # consent table and was never read — it holds the permission grants (GPS,
+    # LOCAL_DISCOVERY …) with their own definitions and sync state. What a subject
+    # consented to, and when, is squarely evidential, so it is merged in here with
+    # its origin recorded rather than left to the raw-table browser.
+    consent_db = paths.db("consent")
+    if consent_db:
+        with SQLiteReader(consent_db) as db:
+            if db.has_table("consent"):
+                for c in db.query("SELECT consentId, subjectRefId, dataType, useCaseId, "
+                                  "acceptType, consentState, endTime, consentSyncState, "
+                                  "consentDefinition FROM consent"):
+                    if "_error" in c:
+                        out["errors"].append(f"consent db: {c['_error']}")
+                        continue
+                    out["consents"].append({
+                        "consent_id": c.get("consentId"),
+                        "state": c.get("consentState"),
+                        "destination": c.get("dataType"),
+                        "accept_type": c.get("acceptType"),
+                        "subject_id": c.get("useCaseId"),
+                        # 'NA' is the source's own placeholder, not a real reference.
+                        "subject_ref": (c.get("subjectRefId")
+                                        if c.get("subjectRefId") not in (None, "", "NA")
+                                        else None),
+                        "sync_state": c.get("consentSyncState"),
+                        "definition": c.get("consentDefinition"),
+                        "end_time": normalize_timestamp(c.get("endTime")),
+                        "source": "consent.consent",
+                    })
+    if db_path:
+        with SQLiteReader(db_path) as db:
             # ledger balances (split bills)
             if db.has_table("ledger_balance_sync"):
                 for l in db.query("SELECT ledger_id, syncSplitType, sync_status, last_sync_time FROM ledger_balance_sync"):
@@ -1582,7 +2206,11 @@ def extract_audit(paths: AndroidCasePaths) -> Dict[str, Any]:
                         "is_gang_group": None,
                     })
     out["device_info"] = _read_crashlytics(paths)
-    out["summary"] = {"ledger_sync_count": len(out["ledger_sync"]), "consent_count": len(out["consents"]),
+    out["summary"] = {"ledger_sync_count": len(out["ledger_sync"]),
+                      "consent_count": len(out["consents"]),
+                      "consent_sources": dict(Counter(c["source"] for c in out["consents"])),
+                      "consent_data_types": dict(Counter(
+                          c["destination"] for c in out["consents"] if c.get("destination"))),
                       "central_sync_count": len(out["central_sync"]), "bg_sync_count": 0}
     return out
 
@@ -2124,7 +2752,14 @@ def extract_deleted_records(paths: AndroidCasePaths) -> Dict[str, Any]:
         "by_pool": dict(by_pool),
         "databases_carved": sorted(out["databases"]),
         "freed_content_retained": retained,
+        # Extent-confidence and value-confidence are separate claims; a record can
+        # have a structurally confirmed extent and still have its fields shifted
+        # into the wrong columns, so both are carried into the summary.
         "high_confidence": sum(1 for r in out["records"] if r["confidence"] == "high"),
+        "value_suspect": sum(1 for r in out["records"]
+                             if r.get("value_confidence") == "low"),
+        "values_fully_decoded": sum(1 for r in out["records"]
+                                    if r.get("value_confidence") == "high"),
         "partial": sum(1 for r in out["records"] if r["partial"]),
         "ambiguous": sum(1 for r in out["records"] if r["ambiguous"]),
     }

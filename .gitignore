@@ -30,6 +30,11 @@ exports/
 scratchpad/
 *.log
 
+# Per-session run logs. These quote real values out of the acquisition under
+# examination (transaction ids, amounts, counterparty counts) so they are working
+# notes only — STATE.md and CONTINUE.md are the committable summaries.
+notes/sessions/
+
 # Python
 __pycache__/
 *.py[cod]

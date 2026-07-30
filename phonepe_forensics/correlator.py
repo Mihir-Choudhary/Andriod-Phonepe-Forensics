@@ -14,6 +14,28 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
+# Transaction-state vocabulary lives in the platform-neutral core so the parser and
+# this module cannot disagree about what "succeeded" means. See core/common.py.
+from .core import (  # noqa: F401
+    FAILED_STATES, PENDING_STATES, SUCCESS_STATES, normalise_state,
+)
+
+
+def _state(txn: Dict[str, Any]) -> str:
+    return normalise_state(txn.get("state"))
+
+
+def is_success(txn: Dict[str, Any]) -> bool:
+    """True when this transaction's state means money actually moved."""
+    return _state(txn) in SUCCESS_STATES
+
+
+def is_unsuccessful(txn: Dict[str, Any]) -> bool:
+    """True for failed *or* still-pending payments."""
+    s = _state(txn)
+    return s in FAILED_STATES or s in PENDING_STATES
+
+
 # ---------------------------------------------------------------------------
 # Unified timeline
 # ---------------------------------------------------------------------------
@@ -101,6 +123,28 @@ def build_unified_timeline(case_data: Dict[str, Any], limit: int = 5000) -> List
                 "raw_msg_count": t.get("raw_message_count"),
             },
             "link_id": t.get("topic_id"),
+        })
+
+    # Delivered notifications. A topic's updated_at only says the channel was
+    # active; these are the messages the user was actually shown, with their own
+    # arrival times — and on a real device they reach years further back than the
+    # transaction ledger does, so they carry much of the timeline's early history.
+    for m in case_data.get("notifications", {}).get("raw_messages", []):
+        if not m.get("is_notification"):
+            continue                       # sync instructions are machine chatter
+        ts = m.get("created_at") or m.get("sent_at")
+        if not ts:
+            continue
+        title = m.get("title") or m.get("body") or "(no title)"
+        events.append({
+            "when_ms": ts["epoch_ms"],
+            "when_iso": ts["iso"],
+            "source": "Notification",
+            "kind": "NOTIFICATION_SHOWN",
+            "title": f"Notification: {title}",
+            "detail": {"subtitle": m.get("subtitle"), "deeplink": m.get("deeplink"),
+                       "template": m.get("template"), "topic_id": m.get("topic_id")},
+            "link_id": m.get("message_id"),
         })
 
     # KN analytics events
@@ -314,6 +358,18 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
                          ("upi_state", c.get("upi_state"))):
             if val and not node.get(key):
                 node[key] = val
+        # `on_phonepe` cannot ride the gap-fill above, for two reasons. False is
+        # falsy, so `not node.get(key)` reads a stored False as "no value yet";
+        # and the rule is not gap-fill but *any-row-wins* — the one the contacts
+        # page states in words ("true if any row for that person states it").
+        # Without this the graph was first-row-wins, so for the 3 people whose
+        # duplicate rows disagree, /contacts counted them on PhonePe while the
+        # social graph said they were not: one exhibit contradicting itself.
+        row_on_pp = c.get("on_phonepe")
+        if row_on_pp is True:
+            node["on_phonepe"] = True
+        elif row_on_pp is False and node.get("on_phonepe") is None:
+            node["on_phonepe"] = False
         nodes[node_id] = node
         if c.get("phone"):
             by_phone.setdefault(c["phone"], node)
@@ -341,7 +397,11 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
                 "phone": normalized,
                 "vpa": None,
                 "connection_id": None,
-                "on_phonepe": False,
+                # Not False: this node exists precisely because the phonebook entry
+                # matched no PhonePe contact record, which is absence of evidence,
+                # not evidence of absence. `kind: PHONEBOOK_ONLY` already carries
+                # "no PhonePe record found" without asserting the person has none.
+                "on_phonepe": None,
                 "txn_count_in": 0, "txn_count_out": 0,
                 "txn_total_in": 0.0, "txn_total_out": 0.0,
                 "chat_message_count": 0, "chat_payment_count": 0,
@@ -384,11 +444,11 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
         amt = t.get("amount_inr") or 0.0
         if t.get("direction") == "IN":
             node["txn_count_in"] += 1
-            if t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"):
+            if is_success(t):
                 node["txn_total_in"] += amt
         elif t.get("direction") == "OUT":
             node["txn_count_out"] += 1
-            if t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"):
+            if is_success(t):
                 node["txn_total_out"] += amt
         ts = t.get("created_at")
         if ts:
@@ -410,6 +470,7 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
     groups_by_id = {g.get("group_id"): g for g in chat.get("groups", [])}
     member_conn: Dict[Any, str] = {}
     member_display: Dict[Any, str] = {}
+    member_on_phonepe: Dict[Any, bool] = {}
     for mem in chat.get("members", []):
         mid = mem.get("internal_id")
         if mid is None:
@@ -418,10 +479,13 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
             member_conn.setdefault(mid, mem["public_id"])
         if mem.get("display_name"):
             member_display.setdefault(mid, mem["display_name"])
+        if mem.get("phonepe_user") is not None:
+            member_on_phonepe.setdefault(mid, bool(mem["phonepe_user"]))
     # Threads with exactly one non-self member are 1:1, so every message in them
     # belongs to that connection even when the message rows carry no member id.
     solo_conn_by_thread: Dict[Any, str] = {}
     solo_name_by_thread: Dict[Any, str] = {}
+    solo_on_phonepe_by_thread: Dict[Any, bool] = {}
     members_by_thread: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
     for mem in chat.get("members", []):
         members_by_thread[mem.get("group_id")].append(mem)
@@ -430,6 +494,8 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
         if len(others) == 1 and others[0].get("public_id"):
             solo_conn_by_thread[thread] = others[0]["public_id"]
             solo_name_by_thread[thread] = others[0].get("display_name")
+            if others[0].get("phonepe_user") is not None:
+                solo_on_phonepe_by_thread[thread] = bool(others[0]["phonepe_user"])
 
     chat_buckets: Dict[str, Dict[str, Any]] = {}
     for m in chat.get("messages", []):
@@ -440,6 +506,9 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
         conn = member_conn.get(other_member) if other_member is not None else None
         if not conn:
             conn = solo_conn_by_thread.get(thread)
+        on_pp = member_on_phonepe.get(other_member)
+        if on_pp is None:
+            on_pp = solo_on_phonepe_by_thread.get(thread)
         if conn:
             key, resolved = f"conn::{conn}", True
             label = member_display.get(other_member) or solo_name_by_thread.get(thread)
@@ -452,7 +521,10 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
         bucket = chat_buckets.setdefault(key, {
             "messages": 0, "payments": 0, "amount": 0.0,
             "connection_id": conn, "resolved": resolved, "label": label,
+            "on_phonepe": on_pp,
         })
+        if bucket.get("on_phonepe") is None and on_pp is not None:
+            bucket["on_phonepe"] = on_pp
         if not bucket.get("label") and label:
             bucket["label"] = label
         bucket["messages"] += 1
@@ -468,7 +540,12 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
                 "kind": "CHAT_DERIVED" if b["resolved"] else "CHAT_THREAD_ONLY",
                 "name": b.get("label"), "phone": None, "vpa": None,
                 "connection_id": b["connection_id"],
-                "on_phonepe": True,
+                # Was hardcoded True on the reasoning that a chat counterparty must
+                # be a PhonePe user. The chat member record already states it
+                # (`topicMember.onPhonePe`), so read the evidence instead of
+                # inferring it, and leave it unknown when no member row resolves —
+                # a thread-only bucket has no member to speak for.
+                "on_phonepe": b.get("on_phonepe"),
                 "txn_count_in": 0, "txn_count_out": 0,
                 "txn_total_in": 0.0, "txn_total_out": 0.0,
                 "chat_message_count": 0, "chat_payment_count": 0,
@@ -513,6 +590,28 @@ def build_social_graph(case_data: Dict[str, Any]) -> Dict[str, Any]:
 # Corroboration index
 # ---------------------------------------------------------------------------
 
+# Which chat card type contributed an identifier, and therefore what the id IS.
+# EXPENSE_CARD_V2 carries an *expense* id (a split line item) — a bookkeeping
+# entity that never has a transaction_core row, because no money moved when it was
+# created. Counting those as "payments missing from the master ledger" put 25
+# non-payments into that finding on the test acquisition.
+_CHAT_REF_KIND = {
+    "PAYMENT_INFO_CARD": "chat_payment_card",
+    "TRANSACTION_RECEIPT": "chat_receipt",
+    "SETTLEMENT_CARD": "chat_settlement",
+    "EXPENSE_CARD_V2": "split_expense",
+    "GROUP_ACTION": "group_action",
+}
+
+# Reference kinds that assert an actual money movement, and so imply a
+# transaction_core row ought to exist. Settlements are included: a settlement is
+# paid, and its id is observed to match a global_payment_id in real data.
+_PAYMENT_REF_KINDS = frozenset({
+    "ledger_row", "chat_payment_card", "chat_receipt", "chat_settlement",
+    "reward_link", "split_settlement",
+})
+
+
 def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
     """For each *transaction*, list every place in the acquisition that references it.
 
@@ -543,6 +642,7 @@ def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
                     # Two entries turn out to be the same payment — merge them.
                     found["aliases"].update(hit["aliases"])
                     found["sources"].update(hit["sources"])
+                    found["ref_kinds"].update(hit.get("ref_kinds") or ())
                     for k in ("amount_inr", "counterparty", "earliest_iso"):
                         if found.get(k) is None:
                             found[k] = hit.get(k)
@@ -555,6 +655,13 @@ def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
                 "txn_id": aliases[0],
                 "aliases": set(),
                 "sources": set(),
+                # What KIND of identifier each reference was. A split expense id
+                # and a payment id are both "an id seen in chat", but only one of
+                # them is ever expected to have a transaction_core row, so the
+                # distinction has to be carried, not inferred from the id's shape
+                # (E… is an expense id in one card type and a transaction entity
+                # id in another, so prefixes cannot decide it).
+                "ref_kinds": set(),
                 "amount_inr": seed.get("amount_inr"),
                 "counterparty": seed.get("counterparty"),
                 "earliest_iso": None,
@@ -573,6 +680,7 @@ def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
         if not entry:
             continue
         entry["sources"].add("Transactions")
+        entry["ref_kinds"].add("ledger_row")
         if entry.get("amount_inr") is None:
             entry["amount_inr"] = t.get("amount_inr")
         if entry.get("counterparty") is None:
@@ -589,23 +697,37 @@ def build_corroboration_index(case_data: Dict[str, Any]) -> Dict[str, Any]:
         if not entry:
             continue
         entry["sources"].add("Chat")
+        entry["ref_kinds"].add(_CHAT_REF_KIND.get(m.get("type"), "chat_other"))
         if entry.get("amount_inr") is None:
             entry["amount_inr"] = m.get("amount_inr")
+        # Date the entry from the chat card too. Without this, any payment with no
+        # transaction_core row has no date at all, and "is this older than the
+        # ledger's retention window?" cannot be asked of exactly the entries the
+        # question matters for.
+        ts = m.get("created_at")
+        if ts and (entry["earliest_iso"] is None or ts["iso"] < entry["earliest_iso"]):
+            entry["earliest_iso"] = ts["iso"]
+        if entry.get("counterparty") is None:
+            entry["counterparty"] = m.get("other_party_name") or m.get("sender_name")
 
     for r in case_data.get("financial", {}).get("rewards", []):
         entry = _entry_for([r.get("linked_transaction")])
         if entry:
             entry["sources"].add("Rewards")
+            entry["ref_kinds"].add("reward_link")
 
     for e in case_data.get("ledger", {}).get("expenses", []):
         entry = _entry_for([e.get("settlement_txn_id")], amount_inr=e.get("amount_inr"))
         if entry:
             entry["sources"].add("Ledger")
+            entry["ref_kinds"].add("split_settlement")
 
     items = []
     for it in entries:
         it["sources"] = sorted(it["sources"])
         it["aliases"] = sorted(it["aliases"])
+        it["ref_kinds"] = sorted(it["ref_kinds"])
+        it["expects_ledger_row"] = any(k in _PAYMENT_REF_KINDS for k in it["ref_kinds"])
         it["corroboration_score"] = len(it["sources"])
         items.append(it)
     items.sort(key=lambda x: (x["corroboration_score"], x["txn_id"]), reverse=True)
@@ -652,20 +774,44 @@ def detect_suspicious_signals(case_data: Dict[str, Any]) -> List[Dict[str, Any]]
 
     # Failed/pending transactions
     txns = case_data.get("transactions", {}).get("transactions", [])
-    failed = [t for t in txns if t.get("state") in ("FAILED", "PENDING", "REJECTED")]
+    failed = [t for t in txns if is_unsuccessful(t)]
     if failed:
+        by_state = Counter(_state(t) or "UNKNOWN" for t in failed)
         findings.append({
             "severity": "medium",
             "category": "failed_transactions",
-            "title": f"{len(failed)} failed/pending transactions",
+            "title": f"{len(failed)} failed/pending transactions "
+                     f"({', '.join(f'{n} {s}' for s, n in by_state.most_common())})",
             "detail": {
                 "count": len(failed),
+                "by_state": dict(by_state),
                 "sample_ids": [f.get("global_payment_id") for f in failed[:5]],
             },
         })
 
+    # A state this build has never seen is neither summed into the totals nor
+    # flagged, so it has to be said out loud rather than silently ignored — that
+    # is exactly how ERRORED went unreported until a real acquisition used it.
+    unknown_states = Counter(
+        _state(t) for t in txns
+        if _state(t) and _state(t) not in SUCCESS_STATES
+        and _state(t) not in FAILED_STATES and _state(t) not in PENDING_STATES
+    )
+    if unknown_states:
+        findings.append({
+            "severity": "medium",
+            "category": "unrecognised_transaction_state",
+            "title": f"{sum(unknown_states.values())} transaction(s) carry a state this "
+                     f"build does not classify ({', '.join(sorted(unknown_states))}) — "
+                     f"they are excluded from both the totals and the failed count",
+            "detail": {"by_state": dict(unknown_states),
+                       "known_success": sorted(SUCCESS_STATES),
+                       "known_failed": sorted(FAILED_STATES | PENDING_STATES)},
+        })
+
     # Very large transactions (> ₹50,000 in a single P2P)
-    large = [t for t in txns if (t.get("amount_inr") or 0) >= 50_000 and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED")]
+    large = [t for t in txns
+             if (t.get("amount_inr") or 0) >= 50_000 and is_success(t)]
     if large:
         findings.append({
             "severity": "info",
@@ -696,15 +842,70 @@ def detect_suspicious_signals(case_data: Dict[str, Any]) -> List[Dict[str, Any]]
     # Payments referenced somewhere in the app but absent from the master ledger —
     # a chat card or reward whose transaction_core row is gone is worth a look.
     corr = build_corroboration_index(case_data)
+    # `expects_ledger_row` filters out identifiers that are not payments at all —
+    # a split expense id has no transaction_core row by design, so its absence is
+    # not evidence of anything.
     one_source = [it for it in corr["items"]
-                  if it["corroboration_score"] == 1 and "Transactions" not in it["sources"]]
+                  if it["corroboration_score"] == 1
+                  and "Transactions" not in it["sources"]
+                  and it.get("expects_ledger_row")]
+    non_payment_refs = [it for it in corr["items"]
+                        if it["corroboration_score"] == 1
+                        and "Transactions" not in it["sources"]
+                        and not it.get("expects_ledger_row")]
     if one_source:
+        # Split by the live ledger's retention window before calling anything
+        # suspicious. PhonePe prunes transaction_core locally while chat keeps its
+        # payment cards far longer, so on a real device most "missing" payments are
+        # simply older than the oldest row the ledger still holds — reporting that
+        # as possible deletion overstates the evidence. Only a payment dated INSIDE
+        # the window, where its sibling rows did survive, is genuinely anomalous.
+        ledger_isos = sorted(t["created_at"]["iso"] for t in txns if t.get("created_at"))
+        oldest_live = ledger_isos[0] if ledger_isos else None
+        newest_live = ledger_isos[-1] if ledger_isos else None
+        before_window, in_window, undated = [], [], []
+        for it in one_source:
+            iso = it.get("earliest_iso")
+            if not iso:
+                undated.append(it)
+            elif oldest_live and iso < oldest_live:
+                before_window.append(it)
+            else:
+                in_window.append(it)
+        for it in one_source:
+            it["retention_verdict"] = (
+                "older than the oldest surviving ledger row" if it in before_window
+                else "inside the ledger's retained period" if it in in_window
+                else "undated")
+
+        headline = (f"{len(one_source)} payment(s) referenced only outside the master ledger "
+                    f"(no matching transaction_core row)")
+        if oldest_live and before_window:
+            headline += (f" — {len(before_window)} predate the oldest surviving ledger row "
+                         f"({oldest_live[:10]}), so local retention explains them; "
+                         f"{len(in_window)} fall inside the retained period")
         findings.append({
-            "severity": "medium",
+            # Only the in-window ones warrant a second look; when every one of them
+            # predates the ledger's own retention this is informational.
+            "severity": "medium" if (in_window or undated) else "info",
             "category": "uncorroborated_transactions",
-            "title": f"{len(one_source)} payment(s) referenced only outside the master ledger "
-                     f"(no matching transaction_core row)",
-            "detail": {"count": len(one_source), "sample": one_source[:5]},
+            "title": headline,
+            "detail": {
+                "count": len(one_source),
+                "live_ledger_range": {"oldest": oldest_live, "newest": newest_live,
+                                      "rows": len(ledger_isos)},
+                "predating_ledger_retention": len(before_window),
+                "inside_retained_period": len(in_window),
+                "undated": len(undated),
+                "note": "A payment older than the oldest surviving transaction_core row is "
+                        "most likely absent because the app pruned it locally, not because "
+                        "it was deleted by a user. Check the Deleted Records page: a carved "
+                        "transaction_core row matching one of these ids is direct evidence "
+                        "the ledger row was removed rather than never retained.",
+                "sample_inside_retained_period": in_window[:5],
+                "sample": one_source[:5],
+                "excluded_non_payment_references": len(non_payment_refs),
+            },
         })
 
     # Wallet balance > 0 (relevant to investigation scope)
@@ -788,8 +989,10 @@ def build_counterparty_profile(case_data: Dict[str, Any], identifier: str) -> Di
                     out["rewards"].append(r)
                     break
 
-    total_in = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "IN" and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"))
-    total_out = sum(t.get("amount_inr") or 0 for t in out["transactions"] if t.get("direction") == "OUT" and t.get("state") in ("COMPLETED", "SUCCESS", "SETTLED"))
+    total_in = sum(t.get("amount_inr") or 0 for t in out["transactions"]
+                   if t.get("direction") == "IN" and is_success(t))
+    total_out = sum(t.get("amount_inr") or 0 for t in out["transactions"]
+                    if t.get("direction") == "OUT" and is_success(t))
     out["summary"] = {
         "matched_contact_count": len(out["matched_contacts"]),
         "transaction_count": len(out["transactions"]),
